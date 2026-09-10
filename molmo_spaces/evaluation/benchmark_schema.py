@@ -200,6 +200,45 @@ class DoorOpeningTaskSpec(BaseTaskSpec):
     door_openness_threshold: float = 0.67  # percentage of door opening
 
 
+class ReorderTaskSpec(BaseTaskSpec):
+    """Restore a remembered object-to-receptacle assignment.
+
+    Order is categorical (which receptacle), not spatial (left/right) -- no VLA
+    placement vocabulary can express direction, so a spatial predicate would
+    measure manipulation scatter rather than memory. See SPEC.md, "Task 2".
+    """
+
+    # object instance name -> receptacle instance name it occupied at source_episode
+    target_assignment: dict[str, str]
+    # Which earlier snapshot is being restored. Provenance for logging; also used
+    # in the task description ("...back where they were at episode N").
+    source_episode: int | None = None
+    # Objects deliberately left in place, so a memoryless baseline can infer
+    # rather than guess blind. Subset of target_assignment keys.
+    cue_objects: list[str] = Field(default_factory=list)
+
+    # Success criteria -- matched to PickAndPlaceTaskSpec so "supported by" means
+    # the same thing here as in the shipped benchmarks.
+    receptacle_supported_weight_frac: float = 0.5
+    carry_forward_rel_pos_threshold: float = 0.05
+    carry_forward_rel_rot_threshold: float = 0.35
+
+
+class ExploreTaskSpec(BaseTaskSpec):
+    """Visit a set of receptacles and observe them.
+
+    No manipulation. Its purpose is to write a fresh *observed* snapshot of the
+    arrangement into memory after an unobserved intervention, which is what makes
+    the memory contents well-defined and satisfies the observability rule for any
+    later restoration that targets this episode.
+    """
+
+    receptacle_names: list[str]
+    # Robot base must come within this distance of each receptacle to count as
+    # having observed it. Matches NavToObjTaskSpec's default.
+    succ_pos_threshold: float = 1.5
+
+
 TaskSpec = (
     PickTaskSpec
     | PickAndPlaceTaskSpec
@@ -208,6 +247,8 @@ TaskSpec = (
     | OpenCloseTaskSpec
     | NavToObjTaskSpec
     | DoorOpeningTaskSpec
+    | ReorderTaskSpec
+    | ExploreTaskSpec
 )
 
 # All TaskSpec subclasses for introspection
@@ -219,6 +260,8 @@ ALL_TASK_SPEC_CLASSES: list[type[BaseTaskSpec]] = [
     OpenCloseTaskSpec,
     NavToObjTaskSpec,
     DoorOpeningTaskSpec,
+    ReorderTaskSpec,
+    ExploreTaskSpec,
 ]
 
 # Fields that are metadata about the task, not configuration to copy

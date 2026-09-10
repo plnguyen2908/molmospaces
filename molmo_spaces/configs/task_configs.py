@@ -187,6 +187,47 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     enable_rendering: bool = True  # Whether to enable environment rendering for visual sensors
 
 
+class ReorderTaskConfig(BaseMujocoTaskConfig):
+    """Configuration for cross-episode arrangement restoration.
+
+    Order is categorical (which receptacle each object sits on), not spatial --
+    no VLA placement vocabulary can express left/right, so a spatial predicate
+    would measure manipulation scatter rather than memory. See SPEC.md, "Task 2".
+    """
+
+    task_cls: type | None = None  # set by the importing module (circular imports)
+    seed: int | None = None
+
+    # object body name -> receptacle body name it occupied at source_episode
+    target_assignment: dict[str, str] = {}
+    source_episode: int | None = None
+    cue_objects: list[str] = []
+
+    # Success criteria -- matched to PickAndPlaceTaskConfig so "supported by"
+    # means the same thing here as in the shipped benchmarks.
+    receptacle_supported_weight_frac: float = 0.5
+    carry_forward_rel_pos_threshold: float = 0.05
+    carry_forward_rel_rot_threshold: float = 0.35
+
+    enable_rendering: bool = True
+
+
+class ExploreTaskConfig(BaseMujocoTaskConfig):
+    """Configuration for an observation-only receptacle visit.
+
+    Writes a fresh *observed* snapshot of the arrangement into memory after an
+    unobserved intervention. No manipulation.
+    """
+
+    task_cls: type | None = None  # set by the importing module (circular imports)
+    seed: int | None = None
+
+    receptacle_names: list[str] = []
+    succ_pos_threshold: float = 1.5  # metres, base-to-receptacle
+
+    enable_rendering: bool = True
+
+
 AllTaskConfigs: TypeAlias = (
     BaseMujocoTaskConfig
     | PickTaskConfig
@@ -197,4 +238,6 @@ AllTaskConfigs: TypeAlias = (
     | OpeningTaskConfig
     | DoorOpeningTaskConfig
     | NavToObjTaskConfig
+    | ReorderTaskConfig
+    | ExploreTaskConfig
 )

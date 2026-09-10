@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 import mujoco
 import numpy as np
 from mujoco import MjData, MjSpec, mjtGeom
+from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.controllers.joint_pos import JointPosController

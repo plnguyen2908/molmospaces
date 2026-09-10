@@ -53,3 +53,8 @@ mlspaces_tests/**/test_data
 # pytest
 .pytest_cache/
 __pycache__/
+
+# Generated run recordings and per-step traces (hundreds of MB); see
+# research/cross_episode_memory/LOCAL_ARTIFACTS.md
+research/cross_episode_memory/artifacts/
+research/cross_episode_memory/demo/

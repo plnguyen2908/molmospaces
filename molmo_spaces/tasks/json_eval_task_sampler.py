@@ -34,10 +34,12 @@ from molmo_spaces.configs.camera_configs import (
 from molmo_spaces.configs.task_configs import (
     BaseMujocoTaskConfig,
     DoorOpeningTaskConfig,
+    ExploreTaskConfig,
     NavToObjTaskConfig,
     OpeningTaskConfig,
     PickAndPlaceColorTaskConfig,
     PickAndPlaceNextToTaskConfig,
+    ReorderTaskConfig,
     PickAndPlaceTaskConfig,
     PickTaskConfig,
 )
@@ -51,10 +53,12 @@ from molmo_spaces.evaluation.benchmark_schema import (
     DoorOpeningTaskSpec,
     EpisodeSpec,
     ExocentricCameraSpec,
+    ExploreTaskSpec,
     NavToObjTaskSpec,
     OpenCloseTaskSpec,
     PickAndPlaceColorTaskSpec,
     PickAndPlaceNextToTaskSpec,
+    ReorderTaskSpec,
     PickAndPlaceTaskSpec,
     PickTaskSpec,
     RobotMountedCameraSpec,
@@ -82,6 +86,8 @@ TASK_CLASS_TO_CONFIG_CLASS: dict[str, type[BaseMujocoTaskConfig]] = {
     "OpeningTask": OpeningTaskConfig,
     "DoorOpeningTask": DoorOpeningTaskConfig,
     "NavToObjTask": NavToObjTaskConfig,
+    "ReorderTask": ReorderTaskConfig,
+    "ExploreTask": ExploreTaskConfig,
 }
 
 # Mapping from task class names to their benchmark schema spec classes.
@@ -95,6 +101,8 @@ TASK_CLASS_TO_SPEC_CLASS: dict[str, type[BaseTaskSpec]] = {
     "OpeningTask": OpenCloseTaskSpec,
     "DoorOpeningTask": DoorOpeningTaskSpec,
     "NavToObjTask": NavToObjTaskSpec,
+    "ReorderTask": ReorderTaskSpec,
+    "ExploreTask": ExploreTaskSpec,
 }
 
 

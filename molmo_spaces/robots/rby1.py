@@ -7,6 +7,7 @@ from mujoco import MjData, MjSpec
 from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.env.rby1_sensors import RBY1GraspStateSensor
 from molmo_spaces.robots.abstract import Robot
+from molmo_spaces.robots.rby1_actuators import configure_rby1_gripper_servos
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
@@ -358,6 +359,7 @@ class RBY1(Robot):
 
     @classmethod
     def apply_control_overrides(cls, spec: MjSpec, robot_config: "BaseRobotConfig"):
+        configure_rby1_gripper_servos(spec)
         # the model root name already includes the hardcoded namespace
         tmp_robot_config = robot_config.model_copy(deep=True)
         tmp_robot_config.robot_namespace = ""
