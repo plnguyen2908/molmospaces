@@ -24,6 +24,7 @@ from research.cross_episode_memory.tools.check_fridge_door import (
 )
 from research.cross_episode_memory.tools.check_fridge_transfer import (
     BREAD_JOINT,
+    F,
     NS,
     FridgeTransfer,
 )
@@ -343,6 +344,12 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
             },
             unlock=self.unlocked_joints(),
             activation_distance=getattr(self.args, "clearance", 0.005),
+            # The rig needed one table box. A kitchen's counters and cabinets are
+            # hundreds of primitives, and cuRobo rejects them past the cache size
+            # rather than silently dropping them.
+            collision_cache=(
+                {"cuboid": 1024, "mesh": 2} if getattr(self.args, "kitchen", False) else None
+            ),
         )
 
     def navigation_penetration(self, data, carrying):
@@ -508,7 +515,38 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
             if self.gaze_command[0] <= low + 1e-3 or self.gaze_command[0] >= high - 1e-3:
                 self.gaze_pan_saturated += 1
 
-    def plan_route(self, goal, carrying):
+    def nav_map_filter(self):
+        """A fast "is this on navigable floor" test built from the scene's own map.
+
+        The search probes MuJoCo for every candidate node and every 2.5 cm of every
+        edge. In the rig's 15x34 cell box that is fine; across a kitchen it is
+        hundreds of thousands of physics calls and never finishes -- one run was
+        killed after 40 minutes still planning.
+
+        The shipped occupancy map answers the same question without physics, so use
+        it to reject cells during the search. It is built for a 0.35 m agent and
+        RB-Y1 is wider, so it cannot be trusted on its own -- the chosen route is
+        still probe-verified afterwards, and execution watches contacts every 2 ms.
+        """
+        if not getattr(self.args, "kitchen", False):
+            return None
+        if getattr(self, "_nav_tree", None) is None:
+            from scipy.spatial import cKDTree
+
+            from molmo_spaces.utils.scene_maps import iTHORMap
+
+            png = self.args.assets / "scenes/ithor/FloorPlan3_physics_map.png"
+            points = np.asarray(iTHORMap.load(path=str(png), agent_radius=0.35).get_free_points())
+            self._nav_tree = cKDTree(points[:, :2])
+            self.record(nav_map_points=int(len(points)))
+        tree = self._nav_tree
+
+        def on_floor(pose):
+            return float(tree.query(np.asarray(pose[:2]))[0]) <= 0.12
+
+        return on_floor
+
+    def plan_route(self, goal, carrying, face=None):
         """A* in x/y/yaw with only forward moves and collision-checked turns."""
         probe = mujoco.MjData(self.model)
         initial = self.data.qpos.copy()
@@ -524,11 +562,17 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         bread_position = initial[bread_adr : bread_adr + 3].copy()
         bread_rotation = R.from_quat(initial[bread_adr + 3 : bread_adr + 7], scalar_first=True)
         cache = {}
+        on_floor = self.nav_map_filter()
 
         def clear(pose, padded=False):
             key = (*np.round(pose, 5), padded)
             if key in cache:
                 return cache[key]
+            # Cheap rejection first: if the scene's own map says this is not floor,
+            # there is no point asking the physics.
+            if on_floor is not None and not on_floor(pose):
+                cache[key] = False
+                return False
             offsets = [(0, 0)]
             if padded:
                 offsets += [(-0.025, 0), (0.025, 0), (0, -0.025), (0, 0.025)]
@@ -565,7 +609,12 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         # in the graph at all and A* expanded one state and gave up.
         span = np.stack([np.asarray(start[:2], dtype=float), np.asarray(goal[:2], dtype=float)])
         margin = 1.2
-        origin = np.floor((span.min(axis=0) - margin) / step) * step
+        raw = np.floor((span.min(axis=0) - margin) / step) * step
+        # Put the grid exactly through the robot's starting point. Otherwise the
+        # first hop goes from the true start to the nearest cell centre, which moves
+        # AND turns at once, and the execution gate rejects it: a drive primitive is
+        # not allowed to change heading.
+        origin = start[:2] - np.round((start[:2] - raw) / step) * step
         far = np.ceil((span.max(axis=0) + margin) / step) * step
         shape = np.rint((far - origin) / step).astype(int) + 1
         angles = np.array(
@@ -591,7 +640,14 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         def world(node):
             return np.array([*(origin + step * np.asarray(node[:2])), angles[node[2]]])
 
-        goal = np.array([*goal, 0.0])
+        # Which way to end up pointing. It used to be hard-coded to zero, which was
+        # right in the rig only because the table happened to sit at +x. In the
+        # kitchen the loaf is behind the robot at that heading -- reachable distance,
+        # wrong side -- so the arm cannot plan to it. Snap the requested heading to
+        # the eight the planner turns through.
+        goal_heading = 0.0 if face is None else float(angles[int(np.argmin(np.abs(
+            np.angle(np.exp(1j * (angles - face))))))])
+        goal = np.array([*goal, goal_heading])
         source, target = cell(start), cell(goal)
         if (
             not clear(original_start, padded=True)
@@ -670,10 +726,10 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         self.record(se2_states_expanded=expanded, collision_probe_cache_entries=len(cache))
         return compact
 
-    def navigate(self, goal, carrying):
+    def navigate(self, goal, carrying, face=None):
         label = "bread to fridge" if carrying else "to distant table"
         self.stage = "plan forward navigation " + label
-        path = self.plan_route(goal, carrying)
+        path = self.plan_route(goal, carrying, face=face)
         self.record(navigation_path_xy_yaw=[p.tolist() for p in path], carrying=carrying)
         start, previous = self.base_pose(), self.base_pose()
         reference = np.linalg.inv(self.tcp()) @ self.bread_pose()
@@ -801,8 +857,16 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         )
         self.record(**metrics)
         self.report["navigation"].append(metrics)
-        if error > 0.01 or distance < abs(self.args.table_y_offset) - 0.1:
-            raise RuntimeError("Navigation did not reach the distinct manipulation stance")
+        # How far it should have gone is the separation between the two stances, not
+        # the rig's -Y table offset: the kitchen's stances are 1.70 m apart, so the
+        # old rule demanded 1.9 m and rejected a route that had arrived correctly.
+        expected = float(np.linalg.norm(np.asarray(goal) - start[:2]))
+        if error > 0.01 or distance < expected - 0.1:
+            raise RuntimeError(
+                f"Navigation did not reach the distinct manipulation stance: "
+                f"travelled {distance:.2f} m of an expected {expected:.2f} m, "
+                f"endpoint error {error:.3f} m"
+            )
 
     def pickup_stance(self):
         """Where to stand to reach the loaf.
@@ -826,10 +890,18 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
     def prepare_pickup(self):
         if self.args.operate_door:
             self.open_fridge()
-        self.navigate(self.pickup_stance(), carrying=False)
+        stance = self.pickup_stance()
+        loaf = np.asarray(self.bread_pose()[:2, 3], dtype=float)
+        self.navigate(stance, carrying=False, face=float(np.arctan2(*(loaf - stance)[::-1])))
 
     def transport_payload(self):
-        self.navigate(np.array([self.args.base_x, self.args.base_y]), carrying=True)
+        fridge_stance = np.array([self.args.base_x, self.args.base_y])
+        fridge_xy = np.asarray(self.data.xpos[self.model.body(F + "_1_0_0").id][:2], dtype=float)
+        self.navigate(
+            fridge_stance,
+            carrying=True,
+            face=float(np.arctan2(*(fridge_xy - fridge_stance)[::-1])),
+        )
         self.planner = self.make_planner()
         self.arm_aids = self.actuator_ids(self.planner.names)
         self.load_world()
@@ -876,6 +948,13 @@ if __name__ == "__main__":
     p.add_argument("--orient-standoff", type=float, default=0.0)
     p.add_argument("--use-torso", type=int, default=0)
     p.add_argument("--kitchen", action="store_true")
+    p.add_argument("--pregrasp-standoff", type=float, default=0.12)
+    p.add_argument("--world-radius", type=float, default=1.5)
+    p.add_argument("--move-retries", type=int, default=0)
+    p.add_argument("--loaf-pos", type=float, nargs=3, default=None)
+    p.add_argument("--grasp-roll", type=float, default=0.0)
+    p.add_argument("--grasp-inset", type=float, default=0.0)
+    p.add_argument("--side-grasp", action="store_true")
     # Stance for reaching the loaf in the kitchen, from the navigation map.
     p.add_argument("--pickup-stance-x", type=float, default=-0.91)
     p.add_argument("--pickup-stance-y", type=float, default=0.68)

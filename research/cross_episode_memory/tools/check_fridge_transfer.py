@@ -25,17 +25,81 @@ BREAD = BREAD_PREFIX + "_1_0_0"
 BREAD_JOINT = BREAD + "_jntfree_0"
 
 
-def collision_mesh(model, data, include_body):
+def geom_box(model, gid):
+    """A geom's bounding box as (centre in the geom frame, half-extent).
+
+    A mesh's vertices are not centred on its frame, so a box built symmetrically
+    about the origin is up to twice the true size -- large enough that kitchen
+    wall meshes engulfed the robot's whole workspace. Carry the centre offset.
+    """
+    if model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH:
+        mid = model.geom_dataid[gid]
+        va, vn = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
+        verts = model.mesh_vert[va : va + vn]
+        lo, hi = verts.min(axis=0), verts.max(axis=0)
+        return (lo + hi) / 2.0, np.maximum((hi - lo) / 2.0, 1e-4)
+    return np.zeros(3), box_half_extent(model, gid)
+
+
+def box_half_extent(model, gid):
+    """Half-extent of a geom's bounding box, whatever its type."""
+    size = np.asarray(model.geom_size[gid], dtype=float)
+    kind = model.geom_type[gid]
+    if kind == mujoco.mjtGeom.mjGEOM_MESH:
+        return geom_box(model, gid)[1]
+    if kind == mujoco.mjtGeom.mjGEOM_SPHERE:
+        return np.full(3, size[0])
+    if kind in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_CYLINDER):
+        return np.array([size[0], size[0], size[1] + (size[0] if kind == mujoco.mjtGeom.mjGEOM_CAPSULE else 0.0)])
+    return size
+
+
+def scene_boxes(model, data, include_geom):
+    """Nearby scene geometry as cuboids.
+
+    Not as mesh: merging hundreds of disjoint scene meshes gives the planner's
+    distance field no consistent inside/outside, and it then reads as blocked
+    everywhere -- measured, a 5 cm nudge failed to plan against a 300k-vertex
+    merge of the kitchen while the same geometry as cuboids planned fine.
+    Primitives are exact; meshes are approximated by their bounding box, which
+    over-states an obstacle and so errs toward refusing to plan, not toward a
+    collision.
+    """
+    boxes = []
+    for gid in range(model.ngeom):
+        if model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        if not (model.geom_contype[gid] or model.geom_conaffinity[gid]):
+            continue
+        if not include_geom(gid):
+            continue
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, data.geom_xmat[gid])
+        centre, half = geom_box(model, gid)
+        origin = data.geom_xpos[gid] + data.geom_xmat[gid].reshape(3, 3) @ centre
+        boxes.append(
+            Cuboid(
+                name=f"scene_{gid}",
+                pose=list(origin - [0, 0, 0.005]) + list(quat),
+                dims=list(2 * half),
+            )
+        )
+    return boxes
+
+
+def collision_mesh(model, data, include_body, include_geom=None):
     """Combine the model's collision triangles in world coordinates."""
     vertices, faces = [], []
     offset = 0
     for gid in range(model.ngeom):
         if not include_body(model.geom_bodyid[gid]):
             continue
+        if include_geom is not None and not include_geom(gid):
+            continue
         if not (model.geom_contype[gid] or model.geom_conaffinity[gid]):
             continue
         if model.geom_type[gid] != mujoco.mjtGeom.mjGEOM_MESH:
-            continue
+            continue  # primitives go to the planner as exact cuboids, see scene_boxes
         mid = model.geom_dataid[gid]
         va, vn = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
         fa, fn = model.mesh_faceadr[mid], model.mesh_facenum[mid]
@@ -187,6 +251,19 @@ class FridgeTransfer:
                 (F, BREAD_PREFIX),
                 robot_xy=(args.base_x, getattr(args, "base_y", 0.0)),
             )
+            # FloorPlan3 leaves the loaf 19 cm back from the counter's front edge, and
+            # measurement says RB-Y1 cannot get it there: probed 6 stances from 0.40 to
+            # 0.90 m and 5 approach pitches from 30 to 90 deg, the hand reaches about
+            # 7 cm past the counter edge and stops, 12 cm short of the loaf, every time.
+            # So the episode may place the loaf where the robot can actually reach it.
+            # This is scene authoring, done once before the run; nothing in the loop
+            # reads it.
+            if getattr(args, "loaf_pos", None):
+                bid = self.model.body(BREAD).id
+                adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
+                self.data.qpos[adr : adr + 3] = args.loaf_pos
+                mujoco.mj_forward(self.model, self.data)
+                self.kitchen_stats["loaf_moved_to"] = list(args.loaf_pos)
             print(json.dumps({"kitchen": self.kitchen_stats}), flush=True)
         else:
             self.model, self.data = make_scene(
@@ -379,12 +456,34 @@ class FridgeTransfer:
         print(json.dumps(item), flush=True)
 
     def load_world(self):
-        v, f = collision_mesh(self.model, self.data, lambda b: b in self.fridge_bids)
+        include = lambda b: b in self.fridge_bids  # noqa: E731
+        near_geom = None
+        extra_boxes = []
+        if getattr(self.args, "kitchen", False):
+            # In the rig the only obstacle was the fridge, all of it mesh. A kitchen's
+            # counters and cabinets are boxes, and a planner that cannot see them routes
+            # the torso straight through -- the arm stalled 119 mm short doing exactly
+            # that. Select by geom rather than body: the whole kitchen shell is one body
+            # whose origin sits at the world origin, so a body-level radius is meaningless.
+            here = np.asarray(self.data.body(NS + "base").xpos[:2], dtype=float)
+            reach = float(getattr(self.args, "world_radius", 1.5))
+
+            def near_geom(gid, here=here, reach=reach):
+                bid = self.model.geom_bodyid[gid]
+                if bid in self.fridge_bids or bid in self.bread_bids:
+                    return False  # the fridge stays a mesh; the loaf is the target
+                if self.model.body(bid).name.startswith(NS):
+                    return False
+                return bool(np.linalg.norm(self.data.geom_xpos[gid][:2] - here) <= reach)
+
+            extra_boxes = scene_boxes(self.model, self.data, near_geom)
+            near_geom = None  # the mesh stays exactly what it was in the rig: the fridge
+        v, f = collision_mesh(self.model, self.data, include, near_geom)
         v[:, 2] -= 0.005
         meshes = [
             Mesh(name="fridge", vertices=v.tolist(), faces=f.tolist(), pose=[0, 0, 0, 1, 0, 0, 0])
         ]
-        boxes = []
+        boxes = list(extra_boxes)
         for gid in self.table_gids:
             boxes.append(
                 Cuboid(
@@ -394,25 +493,50 @@ class FridgeTransfer:
                 )
             )
         self.planner.planner.update_world(SceneCfg(mesh=meshes, cuboid=boxes))
-        self.record(collision_mesh_vertices=len(v), collision_mesh_triangles=len(f))
+        self.record(
+            collision_mesh_vertices=len(v),
+            collision_mesh_triangles=len(f),
+            collision_boxes=len(boxes),
+        )
 
     def move(self, stage, pose):
         self.stage = stage
+        dt = (
+            ceil(self.planner.dt * self.args.motion_slowdown / self.model.opt.timestep)
+            * self.model.opt.timestep
+        )
         positions = [float(self.data.joint(NS + n).qpos[0]) for n in self.planner.names]
         goal = list(pose[:3, 3] - [0, 0, 0.005]) + list(
             R.from_matrix(pose[:3, :3]).as_quat(scalar_first=True)
         )
         trajectory = self.planner.plan(positions, goal)
-        dt = (
-            ceil(self.planner.dt * self.args.motion_slowdown / self.model.opt.timestep)
-            * self.model.opt.timestep
-        )
         for q in trajectory:
             self.data.ctrl[self.arm_aids] = q
             self.tick(dt)
         self.tick(0.4)
+        # Leaning the torso out over a counter puts ~140 N-m of gravity on each torso
+        # joint. At the shipped servo stiffness (kp 4000) that is ~2 deg of droop per
+        # joint, and on this lever arm it left the hand 57 mm short with nothing
+        # touching the robot. Correct in JOINT space, not task space: adding the
+        # shortfall to the tool target aims deeper into the counter and stops being
+        # plannable, whereas nudging the joint command past its own steady-state error
+        # holds the collision-checked configuration to within a couple of degrees.
+        # Proprioception only -- joint sensors and the robot's own kinematics.
+        attempts = 1
+        command = np.asarray(trajectory[-1], dtype=float)
+        for _ in range(int(getattr(self.args, "move_retries", 0))):
+            if float(np.linalg.norm(self.tcp()[:3, 3] - pose[:3, 3])) <= 0.025:
+                break
+            actual = np.array(
+                [float(self.data.joint(NS + n).qpos[0]) for n in self.planner.names]
+            )
+            command = command + (command - actual)
+            self.data.ctrl[self.arm_aids] = command
+            self.tick(0.6)
+            attempts += 1
         error = float(np.linalg.norm(self.tcp()[:3, 3] - pose[:3, 3]))
         self.record(
+            move_attempts=attempts,
             tcp_error_m=error,
             finger_contacts=self.contacts(),
             bread_position=self.data.body(BREAD).xpos.tolist(),
@@ -442,7 +566,18 @@ class FridgeTransfer:
                 other, gid, normal = b1, c.geom1, c.frame[:3]
             else:
                 continue
-            if (gid in self.table_gids if table else other in self.fridge_bids) and normal[2] > 0.7:
+            if table:
+                # The rig gives the loaf a synthetic "table_*" geom to rest on. A real
+                # kitchen does not: it sits on a counter, so accept whatever static
+                # scenery is holding it up, as long as the contact normal points up.
+                supported = gid in self.table_gids or (
+                    getattr(self.args, "kitchen", False)
+                    and other not in self.bread_bids
+                    and not self.model.body(other).name.startswith(NS)
+                )
+            else:
+                supported = other in self.fridge_bids
+            if supported and normal[2] > 0.7:
                 matches.append({"geom": self.model.geom(gid).name, "point": c.pos.tolist()})
         return matches
 
@@ -516,7 +651,49 @@ class FridgeTransfer:
                 bounds[:, 2].max() + self.args.grasp_depth,
             ]
             pre = grasp.copy()
-            pre[2, 3] += 0.12
+            if getattr(self.args, "kitchen", False) and not getattr(
+                self.args, "side_grasp", False
+            ):
+                # Top-down, exactly as the rig does it, just rotated to wherever the
+                # base is standing. The written quaternion is in WORLD coordinates and
+                # assumes the robot faces +x, which is the only way it ever stood in
+                # the rig; in the kitchen it faces the counter.
+                yaw = float(self.data.joint(NS + "base_theta").qpos[0])
+                grasp[:3, :3] = R.from_euler("z", yaw).as_matrix() @ grasp[:3, :3]
+                pre[:3, :3] = grasp[:3, :3]
+                pre[2, 3] += getattr(self.args, "pregrasp_standoff", 0.12)
+            elif getattr(self.args, "kitchen", False):
+                # The rig's loaf sat on a 0.90 m table, low enough to grasp from above.
+                # A kitchen counter is 1.38 m: a top-down grasp needs the hand at about
+                # 1.45 m, the very top of this arm's range, and the counter blocks the
+                # torso lean that would buy the height. Probed across stances from 0.45
+                # to 0.90 m and pitches 0-90 deg, every top-down approach fails to plan
+                # and every side approach succeeds. So come in horizontally, standing
+                # off along the robot's own heading rather than above the loaf.
+                yaw = float(self.data.joint(NS + "base_theta").qpos[0])
+                grasp[:3, :3] = (
+                    R.from_euler("z", yaw - np.pi).as_matrix()
+                    @ R.from_euler("y", np.pi / 2).as_matrix()
+                    @ grasp[:3, :3]
+                )
+                # Pitching the wrist over also rolls the finger axis, so the hand met
+                # the loaf palm-first and shoved it 76 mm instead of straddling it.
+                # Roll about the approach axis to put the fingers either side.
+                roll = np.radians(getattr(self.args, "grasp_roll", 0.0))
+                grasp[:3, :3] = grasp[:3, :3] @ R.from_euler("z", roll).as_matrix()
+                grasp[2, 3] = (bounds[:, 2].min() + bounds[:, 2].max()) / 2
+                pre[:3, :3] = grasp[:3, :3]
+                # The tool point leads the fingertips by 48 mm along the approach, so
+                # driving it to the loaf's centre pushes the hand body through the loaf
+                # -- measured, it shoved the loaf 78 mm before the fingers closed, and
+                # the off-centre grip then slipped on the lift.
+                inset = getattr(self.args, "grasp_inset", 0.0)
+                grasp[:3, 3] = grasp[:3, 3] - inset * np.array([np.cos(yaw), np.sin(yaw), 0.0])
+                back = getattr(self.args, "pregrasp_standoff", 0.12)
+                pre[:3, 3] = grasp[:3, 3] - back * np.array([np.cos(yaw), np.sin(yaw), 0.0])
+            else:
+                # Standoff above the grasp, measured from the loaf's top.
+                pre[2, 3] += getattr(self.args, "pregrasp_standoff", 0.12)
             self.move("pregrasp", pre)
             self.move("grasp approach", grasp)
             self.stage = "close around loaf"
