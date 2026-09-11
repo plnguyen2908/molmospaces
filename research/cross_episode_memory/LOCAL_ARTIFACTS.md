@@ -54,5 +54,11 @@ Two honest limits:
   crept to 66.9 unattended). At 5 degrees it happened to stay put; that is not
   guaranteed, and `door_after_withdrawal_deg` records where it actually ended up.
 
-Repeat runs are in `artifacts/repeat_*`. One pass is not evidence: several fixes
-along the way cleared their limits by margin rather than by design.
+Repeated 4 times (`artifacts/repeat_1..4`): all passed, every one closing to
+exactly 4.98 degrees with 0.000 mm penetration.
+
+Read that carefully. The numbers being *identical* means the pipeline is
+deterministic, so this rules out flakiness -- earlier fixes had cleared their limits
+by margin, and that is no longer a worry. But it is one result reproduced four
+times, not four independent samples: it says nothing about tolerance to a different
+loaf position, start pose, or fridge placement. Robustness is still untested.
