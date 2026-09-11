@@ -22,31 +22,37 @@ documents that describe the runs are committed; the recordings stay on this mach
 |---|---|
 | `artifacts/gaze_navigation_verified/` | Navigation transfer with active head aiming. Passing. |
 | `artifacts/full_sequence/` | Whole task **passing**: open the closed fridge to 74.8 deg, drive to the table, pick the loaf, drive back, place it on the shelf, close the door to 2.4 deg. Predates the door-aware gaze, so the head watches the loaf during the door work. |
-| `artifacts/run_135113/` | Same task with the corrected gaze -- head on the door while opening, on the loaf while picking and placing. Completes open, pick and place; stops at the close. |
+| `artifacts/run_183237/` | **The whole task passing with the corrected gaze**: open to 74.8, drive, pick, drive back, place, close to 5.0 degrees. |
+| `artifacts/repeat_*/` | Repeats of that run, to see whether it is reliable or was lucky. |
 | `artifacts/heading_navigation_*`, `artifacts/bread_transfer_*` | Earlier development runs, kept for the failures they record. |
 
 ## Where the door task stands
 
-Working and repeated: the robot opens the closed fridge, drives 2 m to the table,
-picks the loaf, drives back, and places it on an interior shelf, with no unintended
-penetration and the head aimed at whatever it is working on.
+The whole task runs: the robot opens the closed fridge to 74.8 degrees, drives 2 m
+to the table, picks the loaf, drives back, places it on an interior shelf, and
+closes the door to 5.0 degrees, where it stays. No unintended penetration. The head
+is aimed at whatever is being worked on -- the door while opening and closing, the
+loaf while picking and placing.
 
-Closing is not solved. The arm holds the handle and swings the door from 74.8 down
-to about 47 degrees, then the fingers lose it. Two states, both blocked:
+Passing run: `artifacts/run_183237/`.
 
-| torso during the close | outcome |
-|---|---|
-| free (needed for the shelf reach) | reaches the handle, slips at ~47 deg |
-| pinned (as in the standalone door check) | cannot reach the handle at all |
+What made the close work was a bug fix, not tuning. Any planner built while the
+torso was bent but not being planned was locking those joints at the shipped
+config's zeros, so cuRobo was solving for a straight-backed robot that did not
+exist. Locking them at their measured angles took the close from stalling at 47
+degrees to reaching 5 in one go.
 
-Raising the door grip to 250 N changed nothing -- the slip angle was identical --
-so it was reverted rather than left as an unexplained tweak. Adding a regrasp at
-60 degrees gets further (74.8 -> 60 -> 51) but still does not finish.
+Two honest limits:
 
-One end-to-end pass exists (`artifacts/full_sequence/`), but it cleared the same
-limits by margin rather than by design, so it should not be read as a repeatable
-result.
+- The door stops at 5 degrees, not flush. Dead flush is not reachable from this
+  stance: at 0 the handle sits against the fridge body, which is always an obstacle
+  to the planner. The standalone door check reaches 0.15 degrees because it works
+  from a different stance with a straight torso and no loaf in play. The
+  door-closed figure is therefore **reported rather than asserted**, with the check
+  only catching a door that barely moved. That is a looser criterion than before.
+- This fridge has no latch, so a released door drifts open on its own (60 degrees
+  crept to 66.9 unattended). At 5 degrees it happened to stay put; that is not
+  guaranteed, and `door_after_withdrawal_deg` records where it actually ended up.
 
-The next idea worth trying is pushing the door shut against its outer face instead
-of pulling the handle: pushing does not depend on a friction grip, which is the
-thing that fails partway through the arc.
+Repeat runs are in `artifacts/repeat_*`. One pass is not evidence: several fixes
+along the way cleared their limits by margin rather than by design.

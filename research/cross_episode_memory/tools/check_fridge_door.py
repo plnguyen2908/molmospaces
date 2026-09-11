@@ -164,7 +164,9 @@ class DoorOperations:
         every 2 ms.
         """
         self.stage = stage
-        self.obstacles(articulating=stage in ("opening", "closing"))
+        # Substring, not exact match: any stage that is moving the panel while holding
+        # it must drop the door from the obstacle set, including the final press.
+        self.obstacles(articulating=any(k in stage for k in ("opening", "closing")))
         positions = [float(self.data.joint(NS + n).qpos[0]) for n in self.planner.names]
         goal = list(pose[:3, 3] - [0, 0, 0.005]) + list(
             R.from_matrix(pose[:3, :3]).as_quat(scalar_first=True)
