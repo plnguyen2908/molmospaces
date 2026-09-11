@@ -559,8 +559,15 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
             return all(clear(a + u * (b - a)) for u in np.linspace(0, 1, samples + 1))
 
         step = 0.1
-        origin = np.array([-1.2, self.args.table_y_offset - 0.8])
-        shape = np.rint((np.array([0.3, 0.6]) - origin) / step).astype(int) + 1
+        # Search box around the actual start and goal, not a fixed rectangle. It used
+        # to be hard-coded to the rig's layout (x -1.2..0.3, y offset-0.8..0.6); the
+        # kitchen's fridge stance sits at y=1.92, outside that, so the start was not
+        # in the graph at all and A* expanded one state and gave up.
+        span = np.stack([np.asarray(start[:2], dtype=float), np.asarray(goal[:2], dtype=float)])
+        margin = 1.2
+        origin = np.floor((span.min(axis=0) - margin) / step) * step
+        far = np.ceil((span.max(axis=0) + margin) / step) * step
+        shape = np.rint((far - origin) / step).astype(int) + 1
         angles = np.array(
             [
                 0,
@@ -797,10 +804,29 @@ class NavigationTransfer(DoorOperations, FridgeTransfer):
         if error > 0.01 or distance < abs(self.args.table_y_offset) - 0.1:
             raise RuntimeError("Navigation did not reach the distinct manipulation stance")
 
+    def pickup_stance(self):
+        """Where to stand to reach the loaf.
+
+        The rig puts the table straight down -Y from the fridge, so one offset is
+        enough. A real kitchen does not oblige: in FloorPlan3 the loaf sits on a
+        counter at (-1.51, 0.66) while the fridge is at (1.01, 1.92), so the stance
+        is a proper 2D point taken from the navigation map.
+        """
+        if not self.args.kitchen:
+            return np.array([self.args.base_x, self.args.table_y_offset])
+        # Snap onto the planner's grid. A* steps in 10 cm increments FROM the robot's
+        # current pose, so a goal that is not a whole number of steps away simply is
+        # not in the graph -- it expands one state and gives up. Both kitchen stances
+        # came off the navigation map and were off-grid by a few centimetres.
+        want = np.array([self.args.pickup_stance_x, self.args.pickup_stance_y])
+        here = self.base_pose()[:2]
+        step = 0.1  # matches plan_route's grid
+        return here + np.round((want - here) / step) * step
+
     def prepare_pickup(self):
         if self.args.operate_door:
             self.open_fridge()
-        self.navigate(np.array([self.args.base_x, self.args.table_y_offset]), carrying=False)
+        self.navigate(self.pickup_stance(), carrying=False)
 
     def transport_payload(self):
         self.navigate(np.array([self.args.base_x, self.args.base_y]), carrying=True)
@@ -849,6 +875,10 @@ if __name__ == "__main__":
     p.add_argument("--door2-angle", type=float, default=0.0)
     p.add_argument("--orient-standoff", type=float, default=0.0)
     p.add_argument("--use-torso", type=int, default=0)
+    p.add_argument("--kitchen", action="store_true")
+    # Stance for reaching the loaf in the kitchen, from the navigation map.
+    p.add_argument("--pickup-stance-x", type=float, default=-0.91)
+    p.add_argument("--pickup-stance-y", type=float, default=0.68)
     p.add_argument("--clearance", type=float, default=0.005)
     p.add_argument("--door-slowdown", type=float, default=0.0)
     p.add_argument("--close-stage-angle", type=float, default=40.0)
@@ -895,6 +925,7 @@ if __name__ == "__main__":
         p.error("--turn-speed must be a positive finite value")
     if not np.isfinite(args.nav_speed) or args.nav_speed <= 0:
         p.error("--nav-speed must be a positive finite value")
-    if not np.isfinite(args.table_y_offset) or args.table_y_offset > -1.5:
+    # The -Y offset only describes the rig's layout; the kitchen uses a 2D stance.
+    if not args.kitchen and (not np.isfinite(args.table_y_offset) or args.table_y_offset > -1.5):
         p.error("This navigation check requires the table at least 1.5 m away in negative Y")
     raise SystemExit(NavigationTransfer(args).run())

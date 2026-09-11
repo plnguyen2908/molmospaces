@@ -15,6 +15,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import mujoco
 import numpy as np
 
+from molmo_spaces.configs.robot_configs import RBY1MConfig
 from molmo_spaces.robots.rby1_actuators import configure_rby1_gripper_servos
 from research.cross_episode_memory.tools.check_fridge_door import JOINT, F
 
@@ -174,17 +175,31 @@ class FridgeTransfer:
         self.args = args
         self.output = args.output
         self.output.mkdir(parents=True, exist_ok=True)
-        self.model, self.data = make_scene(
-            args.assets,
-            args.fridge_x,
-            args.table_height,
-            args.base_x,
-            getattr(args, "base_y", 0.0),
-            getattr(args, "table_y_offset", 0.0),
-            getattr(args, "table_foot_half_y", 0.07),
-            getattr(args, "door_angle", 90.0),
-            getattr(args, "door2_angle", 0.0),
-        )
+        if getattr(args, "kitchen", False):
+            # The real FloorPlan3 kitchen instead of the isolated rig. See
+            # research/cross_episode_memory/kitchen_scene.py for why the floor gets a
+            # collision plane and the loose props are frozen.
+            from research.cross_episode_memory.kitchen_scene import make_kitchen
+
+            self.model, self.data, self.kitchen_stats = make_kitchen(
+                args.assets,
+                RBY1MConfig(),
+                (F, BREAD_PREFIX),
+                robot_xy=(args.base_x, getattr(args, "base_y", 0.0)),
+            )
+            print(json.dumps({"kitchen": self.kitchen_stats}), flush=True)
+        else:
+            self.model, self.data = make_scene(
+                args.assets,
+                args.fridge_x,
+                args.table_height,
+                args.base_x,
+                getattr(args, "base_y", 0.0),
+                getattr(args, "table_y_offset", 0.0),
+                getattr(args, "table_foot_half_y", 0.07),
+                getattr(args, "door_angle", 90.0),
+                getattr(args, "door2_angle", 0.0),
+            )
         if args.soft_finger:
             # Explicit simulation assumption: a finite contact patch resists
             # twisting/rolling, unlike a single three-dimensional point contact.
