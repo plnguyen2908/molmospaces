@@ -64,10 +64,10 @@ class RightArmPlanner:
                 num_ik_seeds=32,
                 num_trajopt_seeds=4,
                 # How far the optimiser keeps trajectories off obstacles. The table
-            # is deliberately modelled 5 mm low (so the loaf resting on it is not
-            # a collision), so at the default 5 mm a plan can sit flush with the
-            # real surface and the gripper grazes it.
-            optimizer_collision_activation_distance=activation_distance,
+                # is deliberately modelled 5 mm low (so the loaf resting on it is not
+                # a collision), so at the default 5 mm a plan can sit flush with the
+                # real surface and the gripper grazes it.
+                optimizer_collision_activation_distance=activation_distance,
             )
         )
         self.planner.clear_scene_cache()
@@ -76,6 +76,24 @@ class RightArmPlanner:
         self.attachments = AttachmentManager(self.planner.kinematics)
         self.names = self.planner.joint_names
         self.dt = float(self.planner.trajopt_solver.config.interpolation_dt)
+
+    def self_clearance(self, positions, gradient=False):
+        """Minimum signed sphere gap including the shipped self-collision padding."""
+        q = torch.tensor([[positions]], device="cuda", dtype=torch.float32,
+                         requires_grad=gradient)
+        state = JointState.from_position(q, joint_names=self.names)
+        spheres = self.planner.kinematics.compute_kinematics(state).robot_spheres
+        config = self.planner.kinematics.get_self_collision_config()
+        pairs = config.collision_pairs.long()
+        first, second = pairs[:, 0], pairs[:, 1]
+        radii = spheres[..., 3] + config.sphere_padding
+        gaps = ((spheres[:, :, first, :3] - spheres[:, :, second, :3]).norm(dim=-1)
+                - radii[:, :, first] - radii[:, :, second])
+        margin = gaps.min()
+        if gradient:
+            jacobian, = torch.autograd.grad(margin, q)
+            return float(margin.detach()), jacobian.detach().cpu().numpy().reshape(-1)
+        return float(margin.detach())
 
     def plan(self, positions, goal):
         state = JointState.from_position(
@@ -90,7 +108,27 @@ class RightArmPlanner:
         target = GoalToolPose.from_poses({frame: pose}, ordered_tool_frames=[frame], num_goalset=1)
         result = self.planner.plan_pose(target, state, max_attempts=5)
         if result is None or not result.success.any():
-            raise RuntimeError(f"cuRobo failed to plan to {goal}; result={result}")
+            status = getattr(result, "status", "no result")
+            success = result.success.cpu().tolist() if result is not None else None
+            raise RuntimeError(f"cuRobo failed to plan to {goal}; status={status}; success={success}")
+        b, s = result.success.nonzero(as_tuple=True)
+        end = int(result.interpolated_last_tstep[b[0], s[0]].item())
+        trajectory = result.interpolated_trajectory
+        indices = [trajectory.joint_names.index(name) for name in self.names]
+        return trajectory.position[b[0], s[0], :end, indices].cpu().numpy()
+
+    def plan_joints(self, positions, target_positions):
+        """Plan to a nearby IK solution without choosing a different posture."""
+
+        def state(values):
+            return JointState.from_position(
+                torch.tensor([values], device="cuda", dtype=torch.float32),
+                joint_names=self.names,
+            )
+
+        result = self.planner.plan_cspace(state(target_positions), state(positions))
+        if result is None or not result.success.any():
+            raise RuntimeError("cuRobo could not plan to the nearby joint solution")
         b, s = result.success.nonzero(as_tuple=True)
         end = int(result.interpolated_last_tstep[b[0], s[0]].item())
         trajectory = result.interpolated_trajectory

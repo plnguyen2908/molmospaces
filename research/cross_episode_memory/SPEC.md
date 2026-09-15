@@ -57,6 +57,111 @@ task and the likely headline. Task 3 (setup reuse) is unchanged. **Task 4 moves 
 Phase 2**: the only articulated checkpoint overwrites its language goal with a
 privileged point, and MolmoSpaces articulation is a bare joint-range check.
 
+### Current population policy (2026-09-13, user revision)
+
+Keep the native house architecture and fixed receptacles. Remove the originally
+spawned loose objects, then populate every native fixed receptacle with
+objects having nonempty filtered grasp annotations. This supersedes the earlier
+requirement to manipulate only originally spawned objects. Preserve asset size
+and shape; do not manufacture easier geometry. Record each object's asset,
+annotation file, initial support and placement. Validate collision-free placement
+and settled physical support; annotation availability alone is not proof of a
+successful robot grasp. Audit individual sites separately: closed drawer interiors
+and obstructed shelf sites can remain unavailable, but report them explicitly;
+a populated furniture object does not imply every one of its sites is filled.
+
+The reorder sequence still operates between exactly two selected receptacles.
+For the two-cycle run, randomly select four distinct annotated object instances,
+balanced two per receptacle, so each of the four primary locomanip transfers
+introduces a different object. Populate their task
+objects near usable edges, with the footprint supported and space between
+objects for gripper access. Books may intentionally overhang a table edge by up
+to 4 cm so the gripper can approach the exposed edge; physical settling must
+still establish stable support. Prefer outward approaches clear of nearby obstacles;
+validate actual robot docking and reach separately. Other populated receptacles
+remain scene context.
+Dynamic changes still use only objects physically manipulated in that run.
+
+### Current execution scene: full ProcTHOR house, two tables (2026-09-13)
+
+The user has superseded the fridge scene for the next engineering test. Load a
+complete native ProcTHOR house, preserving all rooms, furniture and obstacles.
+Choose exactly two existing tables with naturally spawned objects. The eligible
+pool is drawn exclusively from objects initially on those two tables; do not
+import objects from other supports or insert synthetic props. Select suitable
+annotated objects flexibly, with no two-object cap. Annotation availability is
+screening only; retain physical contact, lift, carry, release and support checks.
+
+Keep the two-transfer → dynamic-change → revisit history protocol and restoration
+of an earlier post-change snapshot. Include transfers in both directions. Dynamic
+changes may involve only objects already physically manipulated in that run and
+reuse demonstrated placements. Render the execution after termination, including
+failed runs through their failure endpoint. The older fridge requirements below
+remain a record of the previous scenario, not constraints on the two-table scene.
+
+### Two-receptacle execution test requirements (2026-09-13)
+
+This bounded iTHOR/RB-Y1 engineering test uses an explicitly labelled simulator-state
+oracle with cuRobo and annotated grasps. It validates physical execution; it does
+not count as a no-privileged-state VLA baseline result above.
+
+- Exactly two task receptacles: sink plus adjoining countertop, and fridge.
+  Record their physical support-body mapping explicitly. Left/right fridge compartments
+  are parts of the same receptacle, not a third task receptacle.
+- Start with all doors closed. Execute **two locomanip transfers → dynamic change →
+  revisit/save → two locomanip transfers → dynamic change → revisit → restore the
+  first post-change snapshot**. No initial or pre-change inspection tour.
+- Ordinary work must include both counter→fridge and fridge→counter physical
+  transfers, introducing new native annotated objects in later batches. Default
+  pool: egg, potato, salt shaker. First transfer egg/potato to fridge, reset potato
+  to its demonstrated counter pose, revisit/save. Then retrieve egg and transfer
+  salt shaker to fridge; exchange shaker back to counter and potato to fridge;
+  revisit. Restore by retrieving potato and returning egg to fridge. This is six
+  physical transfers; a fourth object requires at least three change cycles.
+- Each consecutive pair of locomanip transfers shares one right-door access
+  cycle: open before the first, keep it open between transfers, and close after
+  the second. Both directions follow this rule. Each fridge revisit still opens
+  and closes independently; the final restoration batch closes when finished.
+  The two-change run uses five door cycles. Never revisit/inspect or apply a
+  dynamic change inside a locomanip batch.
+- **Current user-approved scope: right fridge door and right compartment only.**
+  The left door stays closed. The sink counter and the accessible part of the
+  fridge still count as exactly two task receptacles.
+- Restore the existing cuRobo handle pull and physical recorded-path closure.
+  The experimental partial-pull/panel-push controller is excluded from this task.
+- Placement and dynamic-change feasibility use reachable, supported, collision-free
+  right-compartment slots. If the right has no valid space, reject the proposed
+  work/change before pickup or live mutation. Do not fall back to the left side.
+- Revisit the accessible right compartment with its door open, then close it.
+  Reject tracked objects on the disabled left side rather than claiming to observe
+  or manipulate them through its closed door. Complete two-door inspection and
+  left-side overflow are deferred until their physical controller is validated.
+- **No duplicate feasibility rollout.** Only objects successfully picked,
+  carried and released in this live run may be changed. Reuse that object's
+  demonstrated pickup/placement poses on the requested support. Check current
+  occupancy of the simultaneous proposed changes once, then verify settled
+  support after the explicit harness relocation. A grasp annotation by itself
+  does not qualify an object. Preserve the requested historical target. These
+  past successes do not guarantee a future motion plan; retain live collision,
+  force and support checks. Never silently count failed work as eligibility.
+- Physical grasp/carry uses finger contacts and forces, with no held-object weld or
+  pose teleport. Harness relocations occur only as explicit logged dynamic changes.
+- Render only after the run ends. **Successful and failed full runs both produce
+  videos**; failed runs show the recorded execution through the failure endpoint
+  and remain labelled failures. Never render while that run is executing. Save
+  the physics outcome before rendering. This supersedes the earlier no-failure-video rule.
+
+The fresh `reorder_right_bidirectional_v6` run passed the previous policy
+(close/reopen between transfers) with seed 0: five physical transfers, two changes/revisits, seven right-door
+cycles, and restoration of the first post-change snapshot. Both full videos
+rendered after successful physics. See [CHECK_REORDER_CHAIN.md](CHECK_REORDER_CHAIN.md)
+for evidence, reproduction, contact metrics, and the remaining camera-coverage
+limitation. The shared-door policy and counter-grasp fix have 66 passing focused checks
+and physical pickup/lift/hold checks for both objects. The user's shared-door run
+exposed a counter-approach planning failure after the egg transfer; the complete
+updated sequence remains unvalidated. The previous result is one successful oracle run, not
+a VLA or cross-seed reliability result.
+
 ### Ranked risks
 1. **EchoVLA may already publish a repeated-execution curve.** Highest value
    check available; read its evaluation section before building further.
@@ -1918,3 +2023,103 @@ head geometry is present in MuJoCo navigation probes. The fridge starts open
 at 90 degrees, with continuous door operation and RunTask integration pending.
 See [CHECK_NAVIGATION_TRANSFER.md](CHECK_NAVIGATION_TRANSFER.md) for evidence,
 reproduction and scope.
+
+
+### Fresh native iTHOR historical reorder execution — 2026-09-13
+
+`artifacts/reorder_right_bidirectional_v6` passed a continuous, fresh FloorPlan3
+RB-Y1 run with native annotated egg and potato, sink counter/right fridge only,
+and all authored articulations initially closed. Five physical transfers included
+both directions during ordinary work. Two harness changes were each validated in
+an independent physical clone before live mutation, followed by a live revisit.
+The final transfer restored the first post-change snapshot (egg in fridge, potato
+on counter), with no inspection inserted into a transfer. Seven right-door cycles
+finished closed; the left remained closed. All 18 `history_audit.json` checks pass.
+
+The complete three-view and head-camera videos were rendered after physics,
+at 25 FPS and 5× playback, each 465.08 seconds long. Component and failed attempts
+produced no videos. Runtime fixes include actual-mesh empty-arm path checks,
+torso-frame gaze targets, upright retrieval rolls and joint-limit clearance,
+validated compact carry/shorter undocking, adaptive closing approaches, measured
+stop pushes, and contact-servo bias correction. The contact-selection optimization
+preserved checks on 90 recorded native states while reducing measured loop time
+by 34%; the focused regression suite has 57 passing tests.
+
+This is a single seed-0 oracle-controller execution result. Its finite-pad grasp
+parameters are not calibrated to hardware, and manipulation gaze target coverage
+is 61.6%, so it does not establish continuous visual observability or camera-only
+VLA execution. Full evidence and previous failures are in
+[CHECK_REORDER_CHAIN.md](CHECK_REORDER_CHAIN.md).
+
+
+### Shared access between consecutive locomanip transfers — 2026-09-13
+
+The user removed the per-transfer close/reopen requirement. `run_history` now
+batches each work pair, and restoration batches its required transfers. Both
+shelf and counter placement retain their empty-arm fold but defer closure until
+the final transfer in the batch. Later transfers reuse the open right door and
+its recorded opening trajectory. A batch starts and ends closed; a failed
+transfer aborts without trying extra door motion. Dynamic changes and revisits
+are forbidden even between transfers inside a batch.
+
+Feasibility clones use the same batching, and reports/audits check individual
+door actions plus the shared batch boundaries. The default history now requires
+five complete door cycles (two work pairs, two revisits, one restoration), saving
+two redundant close/reopen operations. All 64 focused tests pass. A full physical
+run of this changed policy has not yet been performed; the v6 videos document
+the previous seven-cycle execution and have not been replaced.
+
+
+### Selected-object labels in execution logs — 2026-09-13
+
+The bread/loaf wording in inherited transfer stages was a display artifact.
+`select_object` selects the current body, collision geometry, joint, and grasp
+annotations; the planning pose reads that body's state. Terminal labels, errors,
+and video captions now use the selected object name, and terminal records include
+the full object ID. Report `stage_label` provides the display text while internal
+stage IDs remain stable for contact-path recovery and saved traces. The binding
+and formatting check in `artifacts/object_logging_check/label_check.json` covers
+both egg and potato, and all 64 focused regressions still pass. This change does
+not reload code into processes already running or rerender existing videos.
+
+
+### User-run comparison and counter-grasp execution fix — 2026-09-13
+
+`reorder_chain_20260913_122737` matches v6's runtime arguments except output,
+uses MuJoCo 3.5.0/cuRobo 1.0, and reproduces its initial state, first door opening
+and egg annotation 586. The updated shared-door sequence completed the egg
+transfer, then failed planning potato approach 2/3 with annotation 334. The new
+arrival history changes planning after the first placement; it was not a different
+Python environment or an initial egg-grasp failure.
+
+Counter annotation selection checked a local IK descent but cached only pregrasp,
+then execution replanned each descent segment. The task now caches and executes
+the dense, actual-mesh-checked contact approach on both supports, with a 3 mm
+tracking limit and rejection of missing cached segments before motion. Lift-off
+from either support uses the existing actual-mesh contact servo because the
+coarse cuRobo model can reject the intentional grasp state. Free-space motion
+continues to use cuRobo. Actual geometry, force and penetration checks remain.
+
+The new `tools/check_counter_grasp_boundary.py` tests saved counter arrivals
+without replaying navigation or rendering video. `shared_door_egg_grasp_v2` and
+`shared_door_potato_grasp_v3` passed physical grasp, 119.7–119.8 mm lift and a
+three-second bilateral force hold. Both recorded zero unintended, self and
+finger/object penetration and no hold-contact loss. Potato used the originally
+failing annotation 334. The preceding restricted-annotation diagnostic rejected
+a self-colliding alternate pregrasp branch, and the first complete-library test
+exposed the lift-planning failure; neither produced video. All 66 focused tests
+pass, including contact tracking and rejection of uncached replanning during
+descent. The complete corrected history has not yet passed a fresh run.
+
+
+### Door interaction versus transfer payload in logs — 2026-09-13
+
+During door access, the persistent payload remains egg or potato; the arm and
+manipulation gaze use the door handle. Console records now distinguish
+`task_object`/`task_object_id` from `interaction_target`, and video captions show
+both target and payload. The legacy report `object` field still names the payload.
+This is a reporting change only. AST comparison against the tested grasp-fix
+snapshot found differences only in reporting methods; the active launcher and
+Python environment were also verified. Evidence is stored in
+`artifacts/object_logging_check/interaction_context_check.json`. No process was
+interrupted, and already-running processes retain their loaded labels.

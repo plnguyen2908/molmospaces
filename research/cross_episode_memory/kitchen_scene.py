@@ -35,17 +35,36 @@ FLOOR_COLLISION_NAME = "kitchen_collision_floor"
 FLOORISH = ("floor", "decal", "mesh_")
 
 
-def floor_height(model, data):
-    """Top of the collidable floor geometry, in world z."""
-    tops = []
-    for gid in range(model.ngeom):
-        name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").lower()
-        if "floor" not in name:
-            continue
-        if not (model.geom_contype[gid] or model.geom_conaffinity[gid]):
-            continue
-        tops.append(float(data.geom_xpos[gid][2] + abs(model.geom_size[gid][2])))
-    return float(np.median(tops)) if tops else 0.0
+def floor_height(model, data, robot_xy=(0.0, 0.0)):
+    """Measure the collision floor near the spawn, excluding furniture/visuals.
+
+    Ray casting accounts for mesh transforms; geom_size is not a mesh's vertical
+    extent. Require a locally flat floor before replacing it with a plane.
+    """
+    groups = model.geom_group.copy()
+    try:
+        model.geom_group[:] = 5
+        for gid in range(model.ngeom):
+            owner = model.body(model.geom_bodyid[gid]).name.lower()
+            if owner.startswith(("floor", "decal")) and (
+                model.geom_contype[gid] or model.geom_conaffinity[gid]
+            ):
+                model.geom_group[gid] = 4
+        mask = np.array([0, 0, 0, 0, 1, 0], dtype=np.uint8)
+        heights = []
+        for dx, dy in ((0, 0), (0.1, 0), (-0.1, 0), (0, 0.1), (0, -0.1)):
+            origin = np.array([robot_xy[0] + dx, robot_xy[1] + dy, 2.0])
+            hit = np.array([-1], dtype=np.int32)
+            distance = mujoco.mj_ray(
+                model, data, origin, np.array([0.0, 0.0, -1.0]), mask, True, -1, hit
+            )
+            if distance >= 0:
+                heights.append(float(origin[2] - distance))
+        if len(heights) < 3 or np.ptp(heights) > 0.01:
+            raise ValueError(f"Cannot establish a flat collision floor: {heights}")
+        return float(np.median(heights))
+    finally:
+        model.geom_group[:] = groups
 
 
 def make_kitchen(
@@ -56,6 +75,8 @@ def make_kitchen(
     scene_name: str = "FloorPlan3_physics.xml",
     plane_floor: bool = True,
     freeze_props: bool = True,
+    task_table_xy: tuple[float, float] | None = None,
+    task_table_height: float = 0.90,
 ):
     """The kitchen with the robot in it, trimmed to something that runs.
 
@@ -64,11 +85,35 @@ def make_kitchen(
     """
     path = assets / "scenes/ithor" / scene_name
     spec = mujoco.MjSpec.from_file(str(path))
+    # Normalize the scene, not the robot: cuRobo's fixed root stays at z=0.
+    # Translate only world children so nested meshes, sites and free bodies all
+    # retain their relative transforms. Added task fixtures use floor-relative z.
+    source_model = spec.compile()
+    source_data = mujoco.MjData(source_model)
+    mujoco.mj_forward(source_model, source_data)
+    source_floor_z = floor_height(source_model, source_data, robot_xy)
+    # Capture before freezing scenery joints: iTHOR assets use zero displacement
+    # for their authored closed doors/drawers. Fail rather than freezing an open one.
+    initial_articulations = {
+        source_model.joint(j).name: float(source_data.qpos[source_model.jnt_qposadr[j]])
+        for j in range(source_model.njnt)
+        if source_model.jnt_type[j] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+    }
+    for bid in range(1, source_model.nbody):
+        if source_model.body_parentid[bid] == 0:
+            spec.body(source_model.body(bid).name).pos[2] -= source_floor_z
+    for kind in ("geom", "site", "camera", "light"):
+        for element in getattr(spec.worldbody, kind + "s"):
+            element.pos[2] -= source_floor_z
+    del source_data, source_model
     # RB-Y1 must be inserted at the origin -- add_robot_to_scene asserts it -- and
     # then driven to where it belongs through its base joints.
     robot_cfg.robot_cls.add_robot_to_scene(
         robot_cfg, spec, "robot_0/", [0.0, 0.0], [1.0, 0.0, 0.0, 0.0]
     )
+    # Match the normal MolmoSpaces environment: RB-Y1 needs gravity
+    # compensation and position-servo finger controls after insertion.
+    robot_cfg.robot_cls.apply_control_overrides(spec, robot_cfg)
     keep = ("robot_0/",) + tuple(dynamic_prefixes)
 
     frozen = 0
@@ -89,6 +134,33 @@ def make_kitchen(
             rgba=[0, 0, 0, 0],
         )
 
+    # Optional task fixture for the incremental transfer check.  It is inserted
+    # into the real FloorPlan3 model before compilation, so navigation, rendering,
+    # MuJoCo contacts, and cuRobo all see the same physical table.
+    if task_table_xy is not None:
+        x, y = map(float, task_table_xy)
+        spec.worldbody.add_geom(
+            name="table_top",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            pos=[x, y, task_table_height - 0.035],
+            size=[0.18, 0.30, 0.035],
+            rgba=[0.35, 0.5, 0.7, 1],
+        )
+        spec.worldbody.add_geom(
+            name="table_pedestal",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            pos=[x + 0.12, y + 0.22, (task_table_height - 0.07) / 2],
+            size=[0.025, 0.025, (task_table_height - 0.07) / 2],
+            rgba=[0.3, 0.32, 0.35, 1],
+        )
+        spec.worldbody.add_geom(
+            name="table_foot",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            pos=[x + 0.12, y + 0.22, 0.02],
+            size=[0.07, 0.07, 0.02],
+            rgba=[0.3, 0.32, 0.35, 1],
+        )
+
     model = spec.compile()
     data = mujoco.MjData(model)
     for axis, value in zip(("base_x", "base_y"), robot_xy):
@@ -99,7 +171,14 @@ def make_kitchen(
             data.ctrl[i] = data.qpos[model.jnt_qposadr[model.actuator_trnid[i, 0]]]
     mujoco.mj_forward(model, data)
 
-    stats = {"frozen_joints": frozen, "plane_floor": plane_floor}
+    stats = {
+        "frozen_joints": frozen,
+        "initial_scene_articulations": initial_articulations,
+        "plane_floor": plane_floor,
+        "source_floor_z": source_floor_z,
+        "scene_z_offset": -source_floor_z,
+        "coordinate_frame": "floor-relative; explicit task positions use this frame",
+    }
     if plane_floor:
         names = [model.body(b).name for b in range(model.nbody)]
         disabled = 0

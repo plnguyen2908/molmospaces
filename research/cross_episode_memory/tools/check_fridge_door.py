@@ -171,7 +171,18 @@ class DoorOperations:
         goal = list(pose[:3, 3] - [0, 0, 0.005]) + list(
             R.from_matrix(pose[:3, :3]).as_quat(scalar_first=True)
         )
-        trajectory = self.planner.plan(positions, goal)
+        if getattr(self.args, "kitchen", False) and (
+            any(k in stage for k in ("opening", "closing")) or stage == "regrasp native handle"
+        ):
+            try:
+                joints = self.nearby_ik(pose, positions)
+                trajectory = self.planner.plan_joints(positions, joints)
+            except RuntimeError:
+                # A nearby IK solution can violate the planner's collision model.
+                # Keep collision checking enabled and ask pose planning for another solution.
+                trajectory = self.planner.plan(positions, goal)
+        else:
+            trajectory = self.planner.plan(positions, goal)
         # Door arcs get their own, slower rate. The torso is free during door work
         # for the reach it gives, and dragging that mass round the hinge arc left the
         # tool 29 mm off its commanded pose, past the 25 mm limit. Slowing the arc
@@ -198,8 +209,7 @@ class DoorOperations:
             raise RuntimeError(f"TCP tracking failed at {stage}: {err:.3f} m")
 
     def angle(self):
-        return float(self.data.joint(JOINT).qpos[0])
-
+        return float(self.data.qpos[self.model.jnt_qposadr[self.jid]])
 
     def gripper(self, opened):
         self.data.actuator(NS + "right_finger_act").ctrl[0] = -0.05 if opened else 0
@@ -220,7 +230,8 @@ class DoorOperations:
             desired = pose.copy()
             desired[:3, 3] = anchor + rotation @ (pose[:3, 3] - anchor)
             desired[:3, :3] = rotation @ pose[:3, :3]
-            self.door_move("opening" if target < initial_angle else "closing", desired)
+            self.commanded_door_angle = float(q)
+            self.door_move("opening" if abs(target) > abs(initial_angle) else "closing", desired)
             if abs(self.angle() - q) > 0.12:
                 raise RuntimeError("Door did not follow the commanded hinge arc")
             if len(self.handle_contacts()) != 2:
@@ -305,7 +316,6 @@ class DoorOperations:
             # silently re-pins the torso and undoes the extra reach.
             unlock=getattr(self, "unlocked_joints", lambda: ())(),
         )
-
 
 
 class DoorCheck(DoorOperations):
@@ -473,9 +483,7 @@ class DoorCheck(DoorOperations):
                 # wrist, so a second pull can carry the door further -- which
                 # placement needs, since the loaf will not go in below 80 degrees.
                 if self.args.reposition_y:
-                    self.reposition(
-                        self.args.reposition_y, np.radians(self.args.reposition_yaw)
-                    )
+                    self.reposition(self.args.reposition_y, np.radians(self.args.reposition_yaw))
                 target = self.regrasp_pose()
                 standoff = target.copy()
                 standoff[:3, 3] -= target[:3, 2] * 0.12

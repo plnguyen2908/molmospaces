@@ -48,7 +48,14 @@ def _delete_blacklisted_bodies(spec: mujoco.MjSpec) -> int:
     Returns:
         Number of bodies deleted.
     """
-    from molmo_spaces.tasks.task_sampler import get_static_asset_blacklist
+    try:
+        from molmo_spaces.tasks.task_sampler import get_static_asset_blacklist
+    except ImportError as exc:
+        # Map generation does not require the optional resource package.  A
+        # missing package should only disable its asset blacklist, rather than
+        # preventing an otherwise valid MuJoCo scene from being mapped.
+        log.warning("Static asset blacklist unavailable while building map: %s", exc)
+        return 0
 
     blacklist = get_static_asset_blacklist()
     if not blacklist:
@@ -80,6 +87,38 @@ def _delete_blacklisted_bodies(spec: mujoco.MjSpec) -> int:
         log.info(f"Deleted {len(bodies_to_delete)} blacklisted bodies from scene")
 
     return len(bodies_to_delete)
+
+
+def _remove_fixed_door_leaves(spec: mujoco.MjSpec) -> int:
+    """Remove closed door leaves that have no joint anywhere in their doorway subtree.
+
+    ProcTHOR occasionally exports a doorway asset with a door mesh but without a
+    hinge.  Such a leaf can never be opened and incorrectly disconnects rooms.
+    Keep the frame, but remove the immovable leaf and handle while constructing
+    the navigation map.
+    """
+    removed = []
+
+    def subtree_has_joint(body) -> bool:
+        return bool(body.joints) or any(subtree_has_joint(child) for child in body.bodies)
+
+    def visit(body) -> None:
+        name = body.name or ""
+        if name.startswith("doorway_") and not subtree_has_joint(body):
+            for child in body.bodies:
+                meshes = [str(getattr(g, "meshname", "")).lower() for g in child.geoms]
+                if any("_doorway_door_" in mesh or "_doorway_handle_" in mesh for mesh in meshes):
+                    removed.append(child)
+            return
+        for child in body.bodies:
+            visit(child)
+
+    visit(spec.worldbody)
+    for body in removed:
+        spec.delete(body)
+    if removed:
+        log.info("Removed %d immovable ProcTHOR door leaf/handle bodies for navigation", len(removed))
+    return len(removed)
 
 
 def _handle_compile_error_and_blacklist(error: Exception) -> None:
@@ -502,6 +541,7 @@ class ProcTHORMap(THORMap):
         """
         # If no simulation data provided, initialize MjData and run forward
         spec = mujoco.MjSpec.from_file(model_path)
+        _remove_fixed_door_leaves(spec)
 
         # Recursively collect all ceiling geoms from all bodies
         ceiling_geoms = []
