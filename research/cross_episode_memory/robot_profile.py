@@ -11,7 +11,7 @@ expressed as an empty tuple, so callers branch on "does this robot have a head"
 instead of on the robot's identity.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -120,7 +120,14 @@ MOBILE_FRANKA = RobotProfile(
 )
 
 
-PROFILES = {profile.name: profile for profile in (RBY1M, MOBILE_FRANKA)}
+# Benchmark B3: the same FR3 and hand, stood on a TidyBot++-sized base. Identical
+# joint names -- only the base geometry and the arm's mount height differ -- so the
+# profile is the mobile Franka's under another name.
+FRANKA_TIDYBOT = replace(MOBILE_FRANKA, name="franka_tidybot")
+
+
+PROFILES = {profile.name: profile
+            for profile in (RBY1M, MOBILE_FRANKA, FRANKA_TIDYBOT)}
 
 
 def profile_for(name: str) -> RobotProfile:

@@ -5,7 +5,13 @@ import numpy as np
 from molmo_spaces.configs.robot_configs import MobileFrankaRobotConfig, RBY1MConfig
 
 
-ROBOT_CONFIGS = {'rby1m': RBY1MConfig, 'franka_droid': MobileFrankaRobotConfig}
+def _tidybot_franka():
+    from research.cross_episode_memory.tidybot_franka import TidyBotFrankaConfig
+    return TidyBotFrankaConfig
+
+
+ROBOT_CONFIGS = {'rby1m': RBY1MConfig, 'franka_droid': MobileFrankaRobotConfig,
+                 'franka_tidybot': _tidybot_franka}
 
 
 def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0., robot='rby1m'):
@@ -39,7 +45,8 @@ def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0., robot='rby1m'
     # scene builder needs nothing robot-specific beyond the config itself.
     if robot not in ROBOT_CONFIGS:
         raise KeyError(f'unknown robot {robot!r}; have {sorted(ROBOT_CONFIGS)}')
-    cfg = ROBOT_CONFIGS[robot]()
+    factory = ROBOT_CONFIGS[robot]
+    cfg = (factory() if robot != 'franka_tidybot' else factory()())
     cfg.robot_cls.add_robot_to_scene(cfg, spec, 'robot_0/', [0., 0.], [1., 0., 0., 0.])
     cfg.robot_cls.apply_control_overrides(spec, cfg)
     model = spec.compile()
