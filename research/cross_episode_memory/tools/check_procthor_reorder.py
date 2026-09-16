@@ -5,6 +5,7 @@ This runner is separate from the retained iTHOR fridge test.
 """
 import argparse
 from contextlib import contextmanager
+import itertools
 import json
 from pathlib import Path
 import traceback
@@ -29,12 +30,15 @@ class TableReorder(TableTransfer):
     def __init__(self, args, selection):
         self.selection = selection
         self.objects = tuple(o['body'] for o in selection['selected_objects'])
+        self.population_objects = tuple(
+            o['body'] for table in selection['tables'] for o in table['objects'])
         self.receptacles = tuple(t['body'] for t in selection['tables'])
         self.object_info = {o['body']: o for o in selection['selected_objects']}
         super().__init__(args)
         self._open_fixed_doorways()
         self.table_bids = {t: self.descendants(t) for t in self.receptacles}
         self.demonstrated = {}
+        self.demonstrated_loaded_stances = {table: [] for table in self.receptacles}
         self.review_phase = 'TASK INITIALIZATION'
         self.group_active = False
         self.current_receptacle = None
@@ -223,7 +227,8 @@ class TableReorder(TableTransfer):
                 self.data.xpos[self.model.body(self.source).id, :2])
             goal_room = self._raw_room_id(
                 self.data.xpos[self.model.body(self.destination).id, :2])
-        cross_room = bool(start_room and goal_room and start_room != goal_room)
+        cross_room = bool(getattr(self, '_force_cross_room_route', False) or
+                          (start_room and goal_room and start_room != goal_room))
         if cross_room:
             # Route through the interior of the physics-verified free space.
             # A 10 cm erosion remains connected in this house and prevents
@@ -391,7 +396,8 @@ class TableReorder(TableTransfer):
         # can strand a start pose beside furniture, which is exactly what
         # happened after placing the egg.
         start_room, goal_room = self.room_id(start[:2]), self.room_id(final[:2])
-        if start_room and start_room == goal_room:
+        if (not getattr(self, '_force_cross_room_route', False) and
+                start_room and start_room == goal_room):
             from research.cross_episode_memory.fast_table_navigation import forward_route
             mapped = self.nav_map_filter(goal)
             # Manipulation stances sit beside the target furniture and can fall
@@ -483,7 +489,7 @@ class TableReorder(TableTransfer):
     def navigation_undock(self):
         # Manipulation stances may have furniture directly behind the base.
         # Start forward-facing travel in place when reverse clearance is absent.
-        return 0.
+        return float(getattr(self, '_pickup_pre_nav_undock', 0.))
 
     def select_object(self, obj):
         if self.attached or getattr(self, 'holding_loaf', False):
@@ -504,11 +510,11 @@ class TableReorder(TableTransfer):
         self.report['object'] = obj
         self.configure_object_force()
 
-    def assignment(self):
+    def assignment(self, objects=None):
         # Direct upward contacts are the evidence; expected state is never
         # substituted for an observed support assignment.
         result = {}
-        for obj in self.objects:
+        for obj in self.objects if objects is None else objects:
             bodies = self.descendants(obj)
             matches = set()
             for c in self.data.contact:
@@ -543,7 +549,7 @@ class TableReorder(TableTransfer):
             return np.linalg.norm(local - [.55, -.28])
         return np.array(min(stance_pool, key=score))
 
-    def manipulation_docks(self, point, table):
+    def manipulation_docks(self, point, table, distance_range=(.48, .92)):
         """Sample physics-reachable floor tiles in the receptacle's room."""
         point = np.asarray(point, dtype=float)
         # Preserve exact scene-validated table stances. Tight furniture layouts
@@ -562,7 +568,7 @@ class TableReorder(TableTransfer):
         # complete than a few hand-written standoff rings.
         target_px = nav_map.pos_m_to_px(np.array([*point[:2], 0.]))
         stride = max(1, int(round(.10 * nav_map.px_per_m)))
-        radius_px = int(np.ceil(1.0 * nav_map.px_per_m))
+        radius_px = int(np.ceil((distance_range[1] + .1) * nav_map.px_per_m))
         r0 = max(stride // 2, int(target_px[0]) - radius_px)
         r1 = min(nav_map.occupancy.shape[0], int(target_px[0]) + radius_px + 1)
         c0 = max(stride // 2, int(target_px[1]) - radius_px)
@@ -576,13 +582,16 @@ class TableReorder(TableTransfer):
                     continue
                 xy = nav_map.pos_px_to_m(np.array([row, col]))[:2]
                 distance = float(np.linalg.norm(point[:2] - xy))
-                if not .48 <= distance <= .92:
+                if not distance_range[0] <= distance <= distance_range[1]:
                     continue
                 yaw = float(np.arctan2(point[1] - xy[1], point[0] - xy[0]))
                 docks.append([float(xy[0]), float(xy[1]), yaw])
         # The target expressed in the robot base frame. Sampling this relation
         # avoids inheriting the wrong side of a wall from table-centred stances.
-        offsets = ((.55, -.28), (.62, -.24), (.70, -.18), (.78, 0.))
+        if distance_range[1] > 1.0:
+            offsets = ((.85, 0.), (1.05, 0.), (1.25, 0.), (1.45, 0.))
+        else:
+            offsets = ((.55, -.28), (.62, -.24), (.70, -.18), (.78, 0.))
         for yaw in np.linspace(-np.pi, np.pi, 32, endpoint=False):
             rotation = np.array([[np.cos(yaw), -np.sin(yaw)],
                                  [np.sin(yaw), np.cos(yaw)]])
@@ -619,7 +628,10 @@ class TableReorder(TableTransfer):
                     return False
             return True
 
-        docks = [pose for pose in docks if same_room_with_clear_approach(pose)]
+        docks = [pose for pose in docks
+                 if distance_range[0] <= np.linalg.norm(
+                     np.asarray(pose[:2])-point[:2]) <= distance_range[1]
+                 and same_room_with_clear_approach(pose)]
         preferred = self.stance(table, point)
         # Deduplicate while retaining the exact poses and rank by the intended
         # target-to-base manipulation relation.
@@ -632,24 +644,74 @@ class TableReorder(TableTransfer):
         self.tuck_for_navigation()
         if self.current_receptacle == self.source:
             self.record(repositioned_within_receptacle=True)
+            # A completed placement can leave the tucked base on the opposite
+            # edge of a wide table with no clearance for a direct docking turn.
+            # Move into open floor first, then solve the next object's pre-nav.
+            interior = self.room_interior_pose(self.room_id(self.base_pose()[:2]))
+            if np.linalg.norm(interior-self.base_pose()[:2]) > .35:
+                heading = float(np.arctan2(
+                    interior[1]-self.base_pose()[1],
+                    interior[0]-self.base_pose()[0]))
+                self._pickup_pre_nav_undock = .15
+                try:
+                    try:
+                        route = self.plan_route(interior, False, face=heading)
+                    except RuntimeError:
+                        self._pickup_pre_nav_undock = 0.
+                        route = self.plan_route(interior, False, face=heading)
+                    self._accepted_route = route
+                    self.navigate(interior, False, face=heading)
+                    self.record(pre_pick_source_room_clearance_pose=interior.tolist())
+                finally:
+                    self._pickup_pre_nav_undock = 0.
         preferred = self.stance(self.source, point)
         poses = self.manipulation_docks(point, self.source)
         here = self.base_pose()
+        def visible_and_reachable(pose):
+            delta = np.asarray(point[:2])-np.asarray(pose[:2])
+            distance = float(np.linalg.norm(delta))
+            bearing = float(np.arctan2(delta[1], delta[0]))
+            facing_error = abs(float(np.arctan2(
+                np.sin(bearing-pose[2]), np.cos(bearing-pose[2]))))
+            return .50 <= distance <= .72 and facing_error <= np.radians(15.)
+        poses = [pose for pose in poses if visible_and_reachable(pose)]
         poses = sorted(poses, key=lambda pose: (
+            abs(np.linalg.norm(np.asarray(pose[:2])-point[:2])-.60),
             np.linalg.norm(np.asarray(pose[:2])-here[:2]),
             abs(float(np.arctan2(np.sin(pose[2]-here[2]),
                                  np.cos(pose[2]-here[2]))))))
+        # A robot already docked at this table first backs straight away before
+        # turning toward the next object. This makes the nearby adjustment
+        # visible, natural, and collision-clear.
+        self._pickup_pre_nav_undock = .15 if self.current_receptacle == self.source else 0.
         rejected = []
-        for target in poses[:48]:
-            try:
-                route = self.plan_route(np.asarray(target[:2]), False, face=target[2])
-            except RuntimeError as exc:
-                rejected.append(str(exc)); continue
-            self._accepted_route = route
-            break
-        else:
-            raise RuntimeError(f'No reachable pickup stance: {rejected}')
-        self.navigate(target[:2], False, face=target[2])
+        try:
+            for target in poses[:48]:
+                try:
+                    route = self.plan_route(np.asarray(target[:2]), False, face=target[2])
+                except RuntimeError as exc:
+                    # A short reverse is preferable when leaving furniture, but
+                    # some successful placement stances have no clearance behind
+                    # the base. Retry the same target with an in-place turn before
+                    # rejecting an otherwise reachable pickup stance.
+                    rejected.append(str(exc))
+                    if self._pickup_pre_nav_undock:
+                        self._pickup_pre_nav_undock = 0.
+                        try:
+                            route = self.plan_route(
+                                np.asarray(target[:2]), False, face=target[2])
+                        except RuntimeError as retry_exc:
+                            rejected.append(str(retry_exc))
+                            continue
+                    else:
+                        continue
+                self._accepted_route = route
+                break
+            else:
+                raise RuntimeError(f'No visible hand-reachable pickup stance: {rejected}')
+            self.navigate(target[:2], False, face=target[2])
+        finally:
+            self._pickup_pre_nav_undock = 0.
         self.last_manipulation_stance[self.source] = self.base_pose().copy()
         self.untuck_for_manipulation()
 
@@ -694,7 +756,9 @@ class TableReorder(TableTransfer):
             footprint = self.bread_vertices()[:, :2]
             reach_limit = np.clip(
                 1. - ((footprint.max(0) - footprint.min(0)).max() / 2. + .02) / half, .3, .97)
-            steps = np.array([-1., -.62, -.3, 0., .3, .62, 1.])
+            # Use inset surface points. Extreme-edge placements created unusual
+            # potato wrist/torso configurations that were hard to recover from.
+            steps = np.array([-.55, -.25, 0., .25, .55])
             for u in steps:
                 for v in steps:
                     offset = np.zeros(3)
@@ -760,15 +824,16 @@ class TableReorder(TableTransfer):
             self._loaded_clear_stances[table] = clear_stances
             self.record(loaded_clear_table_stances=len(clear_stances))
         def access_rank(point):
-            nearest = min(np.linalg.norm(np.asarray(pose)[:2] - point[:2])
-                          for pose in known_stances)
+            distances = [np.linalg.norm(np.asarray(pose)[:2] - point[:2])
+                         for pose in known_stances]
+            comfortable = min(abs(distance-.55) for distance in distances)
             radial = np.linalg.norm(point[:2] - self.data.site_xpos[site, :2])
             history = self.placement_history[table]
             separation = (min(np.linalg.norm(point[:2] - old) for old in history)
                           if history else float('inf'))
             # Prefer a different part of the surface for each transfer while
             # retaining edge reachability as the primary physical constraint.
-            return (separation < .18, nearest, -separation, -radial)
+            return (separation < .18, comfortable, -separation, radial)
         valid_poses = []
         for point in sorted(candidates, key=access_rank):
             pose = np.eye(4)
@@ -873,6 +938,30 @@ class TableReorder(TableTransfer):
     def transport_payload(self):
         # Fold the loaded arm to the same compact pose used for empty navigation.
         self.tuck_loaded_for_navigation()
+        source_room = self._raw_room_id(
+            self.data.xpos[self.model.body(self.source).id, :2])
+        destination_room = self._raw_room_id(
+            self.data.xpos[self.model.body(self.destination).id, :2])
+        if source_room and destination_room and source_room != destination_room:
+            interior = self.room_interior_pose(source_room)
+            start = self.base_pose()
+            if np.linalg.norm(interior-start[:2]) > .35:
+                heading = float(np.arctan2(
+                    interior[1]-start[1], interior[0]-start[0]))
+                self._pickup_pre_nav_undock = .15
+                try:
+                    try:
+                        route = self.plan_route(interior, True, face=heading)
+                    except RuntimeError:
+                        self._pickup_pre_nav_undock = 0.
+                        route = self.plan_route(interior, True, face=heading)
+                    self._accepted_route = route
+                    self.carry_navigation_label = 'loaded source-room clearance'
+                    self.navigate(interior, True, face=heading)
+                    self.record(
+                        loaded_source_room_clearance_pose=interior.tolist())
+                finally:
+                    self._pickup_pre_nav_undock = 0.
         # Select the placement edge only after folding, so reachability is
         # measured with the actual carried-object footprint.
         self.destination_pose = self.choose_placement(self.destination)
@@ -915,8 +1004,16 @@ class TableReorder(TableTransfer):
 
         viable = []
         for placement_index, placement in enumerate(self.placement_pose_options[:12]):
-            placement_docks = self.manipulation_docks(
-                placement[:3, 3], self.destination)[:32]
+            witnessed = list(reversed(
+                self.demonstrated_loaded_stances.get(self.destination, [])))
+            sampled = self.manipulation_docks(
+                placement[:3, 3], self.destination)
+            # Prefer chassis poses that already completed a loaded arrival and
+            # placement at this same table earlier in the run. Keep sampled
+            # alternatives for a different support point or changed occupancy.
+            combined = witnessed + sampled
+            placement_docks = list({tuple(np.round(p, 6)): np.asarray(p)
+                                    for p in combined}.values())[:32]
             for candidate_index, candidate in enumerate(placement_docks):
                 if endpoint_clear(candidate):
                     viable.append((placement_index, placement, placement_docks,
@@ -1034,7 +1131,52 @@ class TableReorder(TableTransfer):
             for axis, value in zip(('x', 'y', 'theta'), command):
                 self.data.actuator(NS + f'base_{axis}_act').ctrl[0] = value
             self.tick(.04)
-        self.tuck_arm()
+        try:
+            self.tuck_arm()
+        except RuntimeError as exc:
+            # Normalize an awkward post-placement wrist configuration before
+            # the final fold: put the empty gripper in the same reachable zone
+            # used by ordinary front-facing manipulation.
+            self.record(post_retreat_tuck_failed=str(exc))
+            yaw = self.base_pose()[2]
+            front = self.tcp().copy()
+            forward = np.array([np.cos(yaw), np.sin(yaw)])
+            right = np.array([np.sin(yaw), -np.cos(yaw)])
+            front[:2, 3] = self.base_pose()[:2] + .45*forward + .22*right
+            front[2, 3] = .85
+            self.move('move empty gripper to front before tuck', front)
+            try:
+                self.tuck_arm()
+                return
+            except RuntimeError as final_exc:
+                self.record(post_front_pose_tuck_failed=str(final_exc))
+            # The placement is already physically committed. Create additional
+            # elbow clearance by backing the empty robot away in small bounded
+            # increments, retrying the collision-aware tuck after each one.
+            failures = []
+            for retry in range(3):
+                start = self.base_pose().copy()
+                end = start.copy()
+                end[:2] -= .12 * np.array(
+                    [np.cos(start[2]), np.sin(start[2])])
+                self.stage = 'additional base retreat before empty tuck'
+                for u in np.linspace(0., 1., 76):
+                    blend = 10*u**3 - 15*u**4 + 6*u**5
+                    command = start + blend*(end-start)
+                    for axis, value in zip(('x', 'y', 'theta'), command):
+                        self.data.actuator(NS + f'base_{axis}_act').ctrl[0] = value
+                    self.tick(.04)
+                    if self.navigation_penetration(self.data, False) > .003:
+                        raise RuntimeError(
+                            'Additional post-placement retreat hit scene geometry')
+                try:
+                    self.tuck_arm()
+                    self.record(post_placement_tuck_extra_retreat_m=.12*(retry+1))
+                    return
+                except RuntimeError as retry_exc:
+                    failures.append(str(retry_exc))
+            raise RuntimeError(
+                f'Post-placement empty tuck failed after additional retreat: {failures}')
 
     @staticmethod
     def retryable_placement(exc):
@@ -1042,7 +1184,8 @@ class TableReorder(TableTransfer):
         return any(key in str(exc) for key in (
             'cuRobo failed to plan',
             'TCP missed above destination table',
-            'Actual-mesh collision in contact move'))
+            'Actual-mesh collision in contact move',
+            'Planned robot self collision during placement'))
 
     def place_payload(self):
         self.review_phase = f'LOCOMANIP: {self.annotation_asset} / place'
@@ -1084,6 +1227,10 @@ class TableReorder(TableTransfer):
                             if not self.retryable_placement(planning):
                                 raise
                             self.record(placement_approach_unplanned=str(planning))
+                            # This placement point has no complete collision-aware
+                            # approach. Do not descend blindly from the staging
+                            # waypoint; let the outer handler select another point.
+                            raise
                         self.mesh_contact_move('lower object onto destination table', candidate)
                     except RuntimeError as exc:
                         if not self.retryable_placement(exc):
@@ -1169,6 +1316,8 @@ class TableReorder(TableTransfer):
         poses = self.demonstrated.setdefault(move.object_name, {})
         poses[move.source] = self.transfer_start.copy()
         poses[move.destination] = self.data.joint(self.object_joint).qpos.copy()
+        self.demonstrated_loaded_stances[move.destination].append(
+            self.base_pose().copy())
         self.report['successful_transfer_witnesses'].append(dict(object=move.object_name, source=move.source, destination=move.destination, time=float(self.data.time)))
 
     def intervene(self, moves):
@@ -1199,51 +1348,207 @@ class TableReorder(TableTransfer):
         self.tick(2.)
         self.record(dynamic_moves=moves, rehearsal_executed=False)
 
+    def room_interior_pose(self, room):
+        nav_map = self._base_nav_map()
+        physics = self.build_physics_reach_map()
+        mask = (physics.occupancy.astype(bool) & (nav_map.room_map == room))
+        pixels = np.argwhere(mask)
+        if not len(pixels):
+            raise RuntimeError(f'No physics-reachable floor in room {room}')
+        median = np.median(pixels, axis=0)
+        pixel = pixels[np.argmin(np.linalg.norm(pixels-median, axis=1))]
+        return nav_map.pos_px_to_m(pixel)[:2]
+
+    def enter_receptacle_room(self, table, centre):
+        """Cross the doorway before solving the local observation approach."""
+        start = self.base_pose()
+        start_room = self.room_id(start[:2])
+        destination_room = self._raw_room_id(centre[:2])
+        if not (start_room and destination_room and
+                start_room != destination_room):
+            return
+        # A post-placement scan can leave the robot close to the source table
+        # with no room for the first global-path turn. Move to open floor using
+        # the local planner first, exactly like an ordinary manipulation undock.
+        source_transit = self.room_interior_pose(start_room)
+        if np.linalg.norm(source_transit-start[:2]) > .35:
+            source_face = float(np.arctan2(
+                source_transit[1]-start[1], source_transit[0]-start[0]))
+            self._force_cross_room_route = False
+            self._pickup_pre_nav_undock = .15
+            try:
+                try:
+                    route = self.plan_route(
+                        source_transit, False, face=source_face)
+                except RuntimeError:
+                    self._pickup_pre_nav_undock = 0.
+                    route = self.plan_route(
+                        source_transit, False, face=source_face)
+                self._accepted_route = route
+                self.record(revisit_source_room_undock=source_transit.tolist())
+                self.navigate(source_transit, False, face=source_face)
+            finally:
+                self._pickup_pre_nav_undock = 0.
+            start = self.base_pose()
+        # Enter the room interior, independent of any later scan/manipulation
+        # stance. The closest free cell to the room's median is robust to odd
+        # concave room outlines and stays away from doorway thresholds.
+        transit = self.room_interior_pose(destination_room)
+        face = float(np.arctan2(centre[1]-transit[1], centre[0]-transit[0]))
+        self._force_cross_room_route = True
+        self._pickup_pre_nav_undock = 0.
+        try:
+            route = self.plan_route(transit, False, face=face)
+            self._accepted_route = route
+            self.record(revisit_cross_room_transit=transit.tolist(),
+                        revisit_start_room=start_room,
+                        revisit_destination_room=destination_room)
+            self.navigate(transit, False, face=face)
+        finally:
+            self._force_cross_room_route = False
+        arrived = self.room_id(self.base_pose()[:2])
+        if arrived != destination_room:
+            raise RuntimeError(
+                f'Cross-room transit ended in room {arrived}, expected {destination_room}')
+
     def observe(self, receptacles):
         if self.group_active:
             raise RuntimeError('Revisit inside locomanip is forbidden')
-        self.review_phase = 'REVISIT: both task tables'
+        self.review_phase = 'REVISIT: one base pose with head-camera sweep'
+        population_assignment = self.assignment(self.population_objects)
+        expected = {obj for obj, support in population_assignment.items()
+                    if support in receptacles}
+        swept = set()
         for table in receptacles:
-            present = [o for o, support in self.assignment().items() if support == table]
-            if present:
-                self.select_object(present[0])
-                point = self.bread_pose()[:3, 3]
-            else:
-                site = self.model.site(self.selection['tables'][self.receptacles.index(table)]['sites'][0]).id
-                point = self.data.site_xpos[site].copy()
-            self.inspection_target = np.asarray(point)
-            preferred = self.stance(table, point)
+            present = [o for o, support in population_assignment.items()
+                       if support == table]
+            selected_here = [obj for obj in present if obj in self.objects]
+            if selected_here:
+                self.select_object(selected_here[0])  # logging label only
+            site = self.model.site(
+                self.selection['tables'][self.receptacles.index(table)]['sites'][0]).id
+            centre = self.data.site_xpos[site].copy()
+            # Keep navigation invariant to transfers and dynamic changes. The
+            # standalone test succeeds from this fixed authored point; choosing
+            # whichever object happens to remain first after a swap changes the
+            # dock set and made the integrated run behave differently.
+            table_info = self.selection['tables'][self.receptacles.index(table)]
+            anchor = np.asarray(
+                table_info['objects'][0].get('position', centre), dtype=float)
+            self.inspection_target = anchor
             self.tuck_for_navigation()
-            if self.current_receptacle == table:
-                self.record(revisit_navigation_skipped=True, table=table)
-            else:
-                # Revisit the exact stance from which this table was physically
-                # manipulated. The generic empty-robot stance pool can choose the
-                # opposite side of a room boundary and inspect through a wall.
-                witnessed = self.last_manipulation_stance.get(table)
-                if witnessed is not None:
-                    poses = [np.asarray(witnessed, dtype=float)]
-                else:
-                    poses = sorted(self.selection['empty_robot_stances'][table],
-                                   key=lambda p: np.linalg.norm(np.asarray(p) - preferred))
-                rejected = []
+            self.enter_receptacle_room(table, centre)
+            # Reuse the proven pre-pick docking band for one close approach.
+            # After this route the base never translates during the scan.
+            poses = [np.asarray(p, dtype=float)
+                     for p in self.manipulation_docks(
+                         anchor, table, distance_range=(.48, .92))]
+            here = self.base_pose()
+            object_distances = [float(np.linalg.norm(
+                self.data.body(obj).xpos[:2]-here[:2])) for obj in present]
+            already_close = bool(
+                self.room_id(here[:2]) == self._raw_room_id(centre[:2]) and
+                object_distances and min(object_distances) <= 1.25)
+            if already_close:
+                # The preceding placement already supplied the close approach.
+                # Preserve that physically reached pose and scan by base/head
+                # rotation instead of asking A* to redock a few centimetres away.
+                poses.insert(0, here.copy())
+                self.record(revisit_reusing_current_close_pose=True,
+                            nearest_receptacle_object_m=min(object_distances))
+            if not poses:
+                raise RuntimeError('No close receptacle revisit stance candidates')
+            start_room = self.room_id(here[:2])
+            destination_room = self._raw_room_id(centre[:2])
+            if start_room == destination_room:
+                poses.sort(key=lambda pose: np.linalg.norm(pose[:2]-here[:2]))
+            # For cross-room travel, manipulation_docks is already ordered around
+            # the scene-validated pre-pick stance. Do not replace that ordering
+            # with straight-line distance through walls.
+            self.record(revisit_dock_order=(
+                'nearest_same_room' if start_room == destination_room
+                else 'validated_pre_pick_cross_room'),
+                revisit_start_room=start_room,
+                revisit_destination_room=destination_room)
+            rejected = []
+            self._pickup_pre_nav_undock = (
+                .15 if self.current_receptacle == table else 0.)
+            self._force_cross_room_route = False
+            try:
                 for target in poses[:48]:
                     try:
-                        route = self.plan_route(np.asarray(target[:2]), False, face=target[2])
+                        route = self.plan_route(target[:2], False, face=target[2])
                     except RuntimeError as exc:
-                        rejected.append(str(exc)); continue
+                        rejected.append(str(exc))
+                        if self._pickup_pre_nav_undock:
+                            self._pickup_pre_nav_undock = 0.
+                            try:
+                                route = self.plan_route(
+                                    target[:2], False, face=target[2])
+                            except RuntimeError as retry_exc:
+                                rejected.append(str(retry_exc))
+                                continue
+                        else:
+                            continue
                     self._accepted_route = route
+                    self.navigate(target[:2], False, face=target[2])
+                    self.current_receptacle = table
                     break
                 else:
-                    raise RuntimeError(f'No reachable revisit stance: {rejected}')
-                self.navigate(target[:2], False, face=target[2])
-                self.current_receptacle = table
-            self.tick(2.)
-            for obj in present:
-                self.inspection_target = self.data.body(obj).xpos.copy()
-                self.tick(1.)
-                self.record(revisit_object=obj, table=table, gaze_error_deg=self.gaze_error_deg())
+                    raise RuntimeError(
+                        f'No route to fixed receptacle revisit stance: '
+                        f'{rejected[-8:]}')
+            finally:
+                self._pickup_pre_nav_undock = 0.
+                self._force_cross_room_route = False
+            # Turn the base in place toward each object while the head tracks it.
+            # This is an actuator motion, not another A* navigation request.
+            scan_targets = [self.data.body(obj).xpos.copy() for obj in present]
+            if not scan_targets:
+                scan_targets = [centre]
+            gaze_errors = []
+            for scan_index, point in enumerate(scan_targets):
+                self.inspection_target = np.asarray(point)
+                start = self.base_pose().copy()
+                bearing = float(np.arctan2(point[1]-start[1], point[0]-start[0]))
+                delta = float(np.arctan2(np.sin(bearing-start[2]),
+                                         np.cos(bearing-start[2])))
+                goal = start[2] + delta
+                low, high = self.model.joint(NS+'base_theta').range
+                if goal < low or goal > high:
+                    alternatives = [goal-2*np.pi, goal+2*np.pi]
+                    goal = min((v for v in alternatives if low <= v <= high),
+                               key=lambda v: abs(v-start[2]))
+                duration = max(1.0, abs(delta)/self.args.turn_speed)
+                self.stage = 'turn base in place for receptacle head scan'
+                for u in np.linspace(0., 1., int(np.ceil(duration/.04))+1):
+                    blend = 10*u**3 - 15*u**4 + 6*u**5
+                    self.data.actuator(NS+'base_x_act').ctrl[0] = start[0]
+                    self.data.actuator(NS+'base_y_act').ctrl[0] = start[1]
+                    self.data.actuator(NS+'base_theta_act').ctrl[0] = start[2] + blend*(goal-start[2])
+                    self.tick(.04)
+                self.tick(.3)
+                gaze_errors.append(self.gaze_error_deg())
+                self.record(revisit_table=table,
+                            revisit_scan_index=scan_index + 1,
+                            revisit_scan_object=(present[scan_index]
+                                                 if present else None),
+                            base_scan_yaw=float(self.base_pose()[2]),
+                            gaze_error_deg=gaze_errors[-1])
+            self.inspection_target = centre
+            swept.update(present)
+            self.record(revisit_receptacle_complete=table,
+                        revisit_view=target.tolist(),
+                        head_scan_targets=len(scan_targets),
+                        head_scan_max_gaze_error_deg=max(gaze_errors, default=0.),
+                        objects_observed=present)
         self.inspection_target = None
+        if swept != expected:
+            raise RuntimeError(
+                f'Revisit incomplete before locomanip: missing {sorted(expected-swept)}')
+        self.record(revisit_sweep_complete=True,
+                    revisit_objects_swept=sorted(swept),
+                    revisit_object_count=len(swept))
         return self.assignment()
 
     def run(self):
@@ -1262,6 +1567,28 @@ class TableReorder(TableTransfer):
             self.finish_run_outputs(completed)
         return 0 if completed else 1
 
+    def run_revisit_only(self):
+        """Exercise both receptacle orbits without manipulation or intervention."""
+        completed = False
+        initial = None
+        try:
+            self.tick(1.)
+            initial = self.assignment()
+            observed = self.observe(self.receptacles)
+            completed = observed == initial
+            if not completed:
+                raise RuntimeError('Revisit changed the physical object assignment')
+        except Exception as exc:
+            self.report.update(error=str(exc), traceback=traceback.format_exc())
+            traceback.print_exc()
+        finally:
+            self.report.update(
+                chain_events=[], snapshots=[], chain_validated=completed,
+                revisit_only=True, initial_assignment=initial,
+                scope='ProcTHOR two-table revisit navigation only')
+            self.finish_run_outputs(completed)
+        return 0 if completed else 1
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -1273,6 +1600,7 @@ def main():
     p.add_argument('--seed', type=int)
     p.add_argument('--selection-only', action='store_true')
     p.add_argument('--map-only', action='store_true')
+    p.add_argument('--revisit-only', action='store_true')
     cli = p.parse_args()
     selection = json.loads(cli.selection.read_text())
     import random
@@ -1287,7 +1615,7 @@ def main():
     # bilateral RB-Y1 grasp during long physical carries.
     excluded_thin = ('book', 'knife', 'fork', 'spoon', 'pen',
                      'pencil', 'card', 'key', 'scissor',
-                     'salt_shaker')
+                     'salt_shaker', 'potato_11')
     def robust_carry_candidate(obj):
         asset = obj.get('asset', '').lower()
         return has_annotations(obj) and not any(token in asset for token in excluded_thin)
@@ -1347,6 +1675,8 @@ def main():
         print(json.dumps({'physics_reachability_map': str(Path(args.scene_xml).with_name(
             Path(args.scene_xml).stem + '_rby1_physics_reach_map_v3.png'))}), flush=True)
         return 0
+    if cli.revisit_only:
+        return check.run_revisit_only()
     return check.run()
 
 

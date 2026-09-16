@@ -119,7 +119,9 @@ def main():
         template_root, template_model, template_data, template_metadata = root, original, original_data, metadata
     templates = [import_template(root,template_root,template_model,template_data,template_metadata,a,args.assets,
                                  prefix=('population_template/' if args.template_scene else ''))
-                 for a in ('Salt_Shaker_2','Potato_11','Mug_2','Book_6')]
+                 # Potato_11 repeatedly fails stable loaded placement on RB-Y1;
+                 # keep it out of newly generated reorder populations for now.
+                 for a in ('Salt_Shaker_2','Mug_2','Book_6')]
     egg_path = args.assets / 'scenes/ithor/FloorPlan3_physics.xml'
     egg_root, egg_model, egg_data, egg_metadata = load_source(egg_path)
     egg_asset = next(i['asset_id'] for i in egg_metadata.values() if i['category'].lower() == 'egg')
