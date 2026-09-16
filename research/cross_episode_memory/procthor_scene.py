@@ -2,10 +2,13 @@
 from pathlib import Path
 import mujoco
 import numpy as np
-from molmo_spaces.configs.robot_configs import RBY1MConfig
+from molmo_spaces.configs.robot_configs import MobileFrankaRobotConfig, RBY1MConfig
 
 
-def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0.):
+ROBOT_CONFIGS = {'rby1m': RBY1MConfig, 'franka_droid': MobileFrankaRobotConfig}
+
+
+def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0., robot='rby1m'):
     spec = mujoco.MjSpec.from_file(str(scene_xml))
     original = spec.compile()
     original_data = mujoco.MjData(original)
@@ -31,7 +34,12 @@ def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0.):
             # their initial physical transform, including native doorway doors.
             spec.delete(joint)
             frozen += 1
-    cfg = RBY1MConfig()
+    # Which embodiment stands in the house is a caller's choice, not a constant.
+    # Both share the holonomic base joints the navigation layer drives, so the
+    # scene builder needs nothing robot-specific beyond the config itself.
+    if robot not in ROBOT_CONFIGS:
+        raise KeyError(f'unknown robot {robot!r}; have {sorted(ROBOT_CONFIGS)}')
+    cfg = ROBOT_CONFIGS[robot]()
     cfg.robot_cls.add_robot_to_scene(cfg, spec, 'robot_0/', [0., 0.], [1., 0., 0., 0.])
     cfg.robot_cls.apply_control_overrides(spec, cfg)
     model = spec.compile()
@@ -39,9 +47,15 @@ def make_house(scene_xml, dynamic_objects, robot_xy, robot_yaw=0.):
     for name, value in zip(('base_x', 'base_y', 'base_theta'), (*robot_xy, robot_yaw)):
         data.joint('robot_0/' + name).qpos[0] = value
         data.actuator('robot_0/' + name + '_act').ctrl[0] = value
-    for side in ('left', 'right'):
-        for index, value in enumerate((0., 0., 0., -.02, 0., 0., 0.)):
-            data.joint(f'robot_0/{side}_arm_{index}').qpos[0] = value
+    # Straighten whatever arms this robot has, by profile rather than by RB-Y1's
+    # naming: a one-armed Franka has no left_arm_* to write to.
+    from research.cross_episode_memory.robot_profile import profile_for
+    arms = list(profile_for(robot).arm_joints)
+    if robot == 'rby1m':
+        arms += [name.replace('right_', 'left_') for name in arms]
+    for name in arms:
+        joint = data.joint('robot_0/' + name)
+        joint.qpos[0] = -.02 if name.endswith('_3') else 0.
     for aid in range(model.nu):
         if model.actuator_trntype[aid] == mujoco.mjtTrn.mjTRN_JOINT:
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[model.actuator_trnid[aid, 0]]]
